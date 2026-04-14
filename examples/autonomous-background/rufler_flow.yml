@@ -1,0 +1,67 @@
+project:
+  name: autonomous-bg-demo
+  description: One-click autonomous background run — `rufler start` and walk away.
+
+memory:
+  backend: hybrid
+  namespace: autonomous-bg-demo
+  init: true
+
+swarm:
+  topology: hierarchical
+  max_agents: 6
+  strategy: specialized
+  consensus: raft
+
+task:
+  main: |
+    Build a CLI tool `jsonq` in Go that reads JSON from stdin and applies
+    a simple jq-like filter (subset: .field, .a.b, .arr[0]).
+    - Unit tests with table-driven style
+    - `go test ./...` must be green
+    - Single binary output to ./bin/jsonq
+  autonomous: true
+  max_iterations: 80
+  timeout_minutes: 120
+
+# One-click autonomous: rufler start → runs headless in background, skips
+# permission prompts, writes everything to .rufler/run.log.
+# Monitor with: rufler watch  |  rufler logs  |  tail -f .rufler/run.log
+execution:
+  non_interactive: true
+  yolo: true
+  background: true
+  log_file: .rufler/run.log
+
+agents:
+  - name: architect
+    type: system-architect
+    role: specialist
+    seniority: lead
+    prompt: |
+      Design package layout (cmd/jsonq, internal/parser, internal/filter).
+      Decide on the minimal filter grammar. Document in memory.
+
+  - name: coder
+    type: coder
+    role: worker
+    seniority: senior
+    prompt: |
+      Implement parser + filter engine + CLI entrypoint. No external deps
+      beyond the standard library. Keep files under 300 lines.
+
+  - name: qa
+    type: tester
+    role: worker
+    seniority: junior
+    prompt: |
+      Table-driven tests covering: simple field access, nested fields,
+      array indexing, error cases. Aim for >80% coverage.
+
+  - name: reviewer
+    type: reviewer
+    role: specialist
+    seniority: senior
+    prompt: |
+      Final gate: `go vet`, `go test -race`, no unwraps/panics on bad input,
+      clean error messages for end users.

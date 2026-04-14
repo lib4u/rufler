@@ -1,0 +1,62 @@
+project:
+  name: rust-grepx
+  description: A minimal ripgrep clone in Rust — recursive regex search with colored output.
+
+memory:
+  backend: sqlite
+  namespace: rust-grepx
+  init: true
+
+swarm:
+  topology: hierarchical
+  max_agents: 5
+  strategy: specialized
+  consensus: raft
+
+task:
+  main: |
+    Build `grepx`, a CLI tool in Rust that recursively searches files
+    for a regex and prints colored matches with file:line:col.
+    - Uses `clap` for arg parsing, `regex` for matching, `walkdir` for traversal,
+      `rayon` for parallelism, `owo-colors` for output.
+    - Flags: -i (case insensitive), -n (line numbers, on by default),
+      --hidden, --glob, -C N (context)
+    - Tests via `cargo test` with a fixture dir
+    - Verify `cargo build --release` and `cargo test` succeed.
+  autonomous: true
+  max_iterations: 60
+  timeout_minutes: 90
+
+agents:
+  - name: architect
+    type: system-architect
+    role: specialist
+    seniority: lead
+    prompt: |
+      Design modules: cli (clap), walker, matcher, printer.
+      Pick traits for testability. Store decisions in memory.
+
+  - name: coder
+    type: coder
+    role: worker
+    seniority: senior
+    prompt: |
+      Implement the binary end-to-end in idiomatic Rust. Use rayon for
+      parallel file processing. No unsafe. No unwraps in library code.
+
+  - name: perf
+    type: performance-engineer
+    role: specialist
+    seniority: senior
+    prompt: |
+      After a working version exists, add a criterion benchmark against
+      a 100MB fixture corpus. Suggest optimizations (bufio sizes, avoid
+      unnecessary allocations). Land only if benches show improvement.
+
+  - name: qa
+    type: tester
+    role: worker
+    seniority: junior
+    prompt: |
+      Integration tests via assert_cmd and tempfile-built fixture trees.
+      Cover: regex match, case insensitive, -C context, --hidden, glob filtering.

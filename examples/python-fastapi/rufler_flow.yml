@@ -1,0 +1,70 @@
+project:
+  name: fastapi-todo
+  description: FastAPI + SQLAlchemy todo API with JWT auth and pytest coverage.
+
+memory:
+  backend: hybrid
+  namespace: fastapi-todo
+  init: true
+
+swarm:
+  topology: hierarchical
+  max_agents: 6
+  strategy: specialized
+  consensus: raft
+
+task:
+  main: |
+    Build a production-ready FastAPI todo service.
+    - POST /auth/register, POST /auth/login (JWT)
+    - CRUD /todos (scoped to user)
+    - SQLAlchemy async + SQLite for dev, Postgres for prod
+    - Alembic migrations
+    - pytest + httpx integration tests, >80% coverage
+    - Dockerfile + docker-compose.yml
+    - Verify: `pytest -q` passes and `uvicorn app.main:app` boots.
+  autonomous: true
+  max_iterations: 80
+  timeout_minutes: 120
+
+agents:
+  - name: architect
+    type: system-architect
+    role: specialist
+    seniority: lead
+    prompt: |
+      Define package layout (app/api, app/models, app/services, app/core).
+      Decide on pydantic v2 schemas, dependency-injection pattern for DB session,
+      and JWT strategy. Document in memory namespace fastapi-todo.
+
+  - name: backend
+    type: backend-dev
+    role: worker
+    seniority: senior
+    prompt: |
+      Implement auth + todos endpoints, SQLAlchemy models, Alembic migrations.
+      Follow architect's decisions exactly. Use async everywhere.
+
+  - name: security
+    type: security-auditor
+    role: specialist
+    seniority: senior
+    prompt: |
+      Audit JWT handling, password hashing (bcrypt), input validation,
+      SQL injection surface, and CORS config. Block merge on critical findings.
+
+  - name: qa
+    type: tester
+    role: worker
+    seniority: senior
+    prompt: |
+      pytest + httpx async client. Cover: auth happy path, bad creds,
+      todo CRUD per-user isolation, 401/403 cases. Aim >80% coverage.
+
+  - name: devops
+    type: cicd-engineer
+    role: worker
+    seniority: junior
+    prompt: |
+      Write Dockerfile (multi-stage, python:3.12-slim) and docker-compose.yml
+      with postgres service. Add a Makefile with `make test` and `make run`.

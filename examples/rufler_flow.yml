@@ -1,0 +1,69 @@
+project:
+  name: go-claude-webui
+  description: Web UI for Claude Code — Go backend that streams claude -p output over WebSocket.
+
+memory:
+  backend: hybrid
+  namespace: go-claude-webui
+  init: true
+
+swarm:
+  topology: hierarchical-mesh
+  max_agents: 8
+  strategy: specialized
+  consensus: raft
+
+task:
+  main: |
+    Build a web UI for Claude Code in Go.
+    - HTTP server on :8080
+    - /ws WebSocket endpoint; client sends {prompt}, server runs `claude -p <prompt>`
+      via os/exec and streams stdout line-by-line back as JSON {type, data}
+    - Simple index.html with textarea, Send button, auto-reconnect WS client
+    - Structure: cmd/server/main.go, internal/ws, internal/claude, web/index.html
+    - go.mod module name: agentix
+    - Verify `go build ./...` succeeds.
+  autonomous: true
+  max_iterations: 100
+  timeout_minutes: 180
+
+agents:
+  - name: architect
+    type: system-architect
+    role: specialist
+    seniority: lead
+    prompt: |
+      Define package layout, interfaces, error handling strategy.
+      Document decisions in memory namespace go-claude-webui.
+
+  - name: backend
+    type: coder
+    role: worker
+    seniority: senior
+    prompt: |
+      Implement the HTTP + WebSocket server and the os/exec wrapper around
+      `claude -p`. Stream stdout line-by-line through a Go channel into WS.
+
+  - name: frontend
+    type: coder
+    role: worker
+    seniority: junior
+    prompt: |
+      Build a minimal HTML/JS frontend: textarea, Send button, streaming output
+      area, auto-reconnecting WebSocket client.
+
+  - name: qa
+    type: tester
+    role: worker
+    seniority: junior
+    prompt: |
+      Write unit tests for the claude runner (use a stub command) and
+      integration tests for the WS handler.
+
+  - name: reviewer
+    type: reviewer
+    role: specialist
+    seniority: senior
+    prompt: |
+      Review for command injection risks in os/exec, goroutine leaks, WS
+      backpressure, and general Go idioms.

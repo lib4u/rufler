@@ -1,0 +1,49 @@
+project:
+  name: md-prompts-demo
+  description: Demo — each agent's prompt lives in its own markdown file under ./agents/
+
+memory:
+  backend: hybrid
+  namespace: md-prompts-demo
+  init: true
+
+swarm:
+  topology: hierarchical
+  max_agents: 6
+  strategy: specialized
+  consensus: raft
+
+task:
+  # Task body lives in an external markdown file — edit ./TASK.md directly.
+  # You can still use `main: |` inline if you prefer.
+  main_path: ./TASK.md
+  autonomous: true
+  max_iterations: 60
+  timeout_minutes: 90
+
+# Each prompt_path is resolved relative to this yml's directory.
+# Create / edit the md files under ./agents/ — rufler reads them at start.
+agents:
+  - name: architect
+    type: system-architect
+    role: specialist
+    seniority: lead
+    prompt_path: ./agents/architect.md
+
+  - name: backend
+    type: coder
+    role: worker
+    seniority: senior
+    prompt_path: ./agents/backend.md
+
+  - name: qa
+    type: tester
+    role: worker
+    seniority: junior
+    prompt_path: ./agents/qa.md
+
+  - name: reviewer
+    type: reviewer
+    role: specialist
+    seniority: senior
+    prompt_path: ./agents/reviewer.md

@@ -1,0 +1,67 @@
+project:
+  name: multi-task-group-demo
+  description: |
+    Multi-task mode with an explicit `group` of subtasks. Each task runs
+    the full agent team against one file. `run_mode: sequential` waits for
+    each task to finish before starting the next; use `parallel` to fire
+    them all at once with per-task log files.
+
+memory:
+  backend: hybrid
+  namespace: multi-group
+
+swarm:
+  topology: hierarchical
+  max_agents: 6
+  strategy: specialized
+  consensus: raft
+
+task:
+  multi: true
+  run_mode: sequential       # sequential | parallel
+  autonomous: true
+  max_iterations: 60
+  timeout_minutes: 90
+  group:
+    backend:
+      file_path: tasks/backend.md
+    frontend:
+      file_path: tasks/frontend.md
+    e2e:
+      file_path: tasks/e2e.md
+
+execution:
+  non_interactive: true
+  yolo: true
+  background: true
+  log_file: .rufler/run.log
+
+agents:
+  - name: architect
+    type: system-architect
+    role: specialist
+    seniority: lead
+    prompt: |
+      Design for the current subtask. Document decisions in shared memory.
+
+  - name: coder
+    type: coder
+    role: worker
+    seniority: senior
+    prompt: |
+      Implement what the architect designed for the current subtask.
+
+  - name: tester
+    type: tester
+    role: worker
+    seniority: junior
+    prompt: |
+      Cover the current subtask with tests. `go test ./...` or equivalent
+      must be green before declaring done.
+
+  - name: reviewer
+    type: reviewer
+    role: specialist
+    seniority: senior
+    prompt: |
+      Final gate: quality, security, clean errors. Block on regressions.

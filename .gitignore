@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+.installed.cfg
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Rufler runtime artifacts (per-project, never commit)
+.rufler/
+.tasks/
+.claude/
+.claude-flow/
+.hive-mind/
+.swarm/
+*.log
+
+# Ruflo / Claude Code dev junk that may land in examples
+examples/**/.rufler/
+examples/**/.tasks/
+examples/**/.claude/
+examples/**/.claude-flow/
+examples/**/node_modules/
+examples/**/*.log

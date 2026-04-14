@@ -1,0 +1,77 @@
+project:
+  name: nextjs-saas-starter
+  description: Next.js 14 SaaS starter — App Router, Prisma, NextAuth, Stripe, Tailwind.
+
+memory:
+  backend: hybrid
+  namespace: nextjs-saas
+  init: true
+
+swarm:
+  topology: hierarchical-mesh
+  max_agents: 8
+  strategy: specialized
+  consensus: raft
+
+task:
+  main: |
+    Build a Next.js 14 SaaS starter:
+    - App Router, TypeScript strict, Tailwind + shadcn/ui
+    - NextAuth (Google + GitHub providers, Prisma adapter)
+    - Prisma + Postgres schema: User, Subscription, Invoice
+    - Stripe checkout + webhook handler for subscription.updated
+    - Protected /dashboard, public /pricing, /
+    - Playwright e2e for signup → checkout → dashboard
+    - Verify `pnpm build` and `pnpm test:e2e` succeed.
+  autonomous: true
+  max_iterations: 120
+  timeout_minutes: 240
+
+agents:
+  - name: architect
+    type: system-architect
+    role: specialist
+    seniority: lead
+    prompt: |
+      Define route layout, server/client component boundary, data-fetching
+      strategy, and env var schema. Pin versions. Document in memory.
+
+  - name: backend
+    type: backend-dev
+    role: worker
+    seniority: senior
+    prompt: |
+      Prisma schema, NextAuth config, Stripe webhook route handler,
+      subscription state reconciliation. All server actions typed.
+
+  - name: frontend
+    type: coder
+    role: worker
+    seniority: senior
+    prompt: |
+      Pages: landing, pricing, dashboard, sign-in. Use shadcn/ui primitives.
+      Responsive. Dark mode via next-themes.
+
+  - name: security
+    type: security-auditor
+    role: specialist
+    seniority: senior
+    prompt: |
+      Audit: webhook signature verification, session cookies, CSRF on
+      server actions, env var leakage to client, RBAC for /dashboard.
+
+  - name: qa
+    type: tester
+    role: worker
+    seniority: junior
+    prompt: |
+      Playwright suite: signup flow, Stripe test-mode checkout,
+      dashboard visibility for subscribed vs free users.
+
+  - name: reviewer
+    type: reviewer
+    role: specialist
+    seniority: senior
+    prompt: |
+      Final review: type safety, server/client boundary misuse, dead code,
+      accessibility of critical flows. Approve or request changes.
