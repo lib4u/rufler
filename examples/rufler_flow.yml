@@ -27,6 +27,30 @@ task:
   max_iterations: 100
   timeout_minutes: 180
 
+# Global Claude Code skills installed into .claude/skills/ before the swarm runs.
+# Proxied to `ruflo init skills --<pack>` for core/agentdb/github/v3; other
+# packs + `extra` are copied from ruflo's bundled source tree.
+skills:
+  enabled: true
+  clean: true               # wipe ruflo init's ~30 default skills before installing
+                            # from yml (yml = single source of truth). false to keep.
+  all: false                # true = install every pack (overrides `packs`)
+  packs: [core, agentdb]    # core | agentdb | github | flowNexus | browser | v3 | dualMode
+  extra: []                 # individual skill dir names under ruflo's .claude/skills/
+  custom: []                # Unified list — local paths AND skills.sh installs.
+                            # Each entry can be:
+                            #   - a local path (abs/~/relative to this yml)
+                            #   - a pasted `npx skills add <source> [flags]` line
+                            #   - a dict: {source, skill?, agent?, copy?}
+                            # rufler tries the filesystem first; unknown strings
+                            # fall back to `npx skills add <source>`. Example:
+                            #   custom:
+                            #     - ./skills/my-skill
+                            #     - ~/shared/claude-skills/awesome
+                            #     - npx skills add https://github.com/samber/cc-skills-golang --skill golang-error-handling
+                            #     - source: vercel-labs/skills
+                            #       skill: azure-ai
+
 agents:
   - name: architect
     type: system-architect

@@ -82,6 +82,28 @@ class Runner:
             args.append("--start-daemon")
         self.run(args)
 
+    def init_skills(
+        self,
+        *,
+        all_packs: bool = False,
+        packs: list[str] | None = None,
+        force: bool = True,
+    ) -> int:
+        """Run `ruflo init skills` with the given pack toggles. Maps directly
+        to ruflo's skillsCommand (v3/@claude-flow/cli/src/commands/init.ts).
+        `packs` must contain only names from config.CLI_FLAG_PACKS — caller
+        is responsible for filtering out MANUAL_COPY_PACKS which have no CLI
+        flag. Returns the subprocess rc — non-fatal for the caller."""
+        args = ["init", "skills"]
+        if all_packs:
+            args.append("--all")
+        else:
+            for p in packs or []:
+                args.append(f"--{p}")
+        if force:
+            args.append("--force")
+        return self.run(args)
+
     def daemon_start(self):
         self.run(["daemon", "start"])
 

@@ -28,7 +28,7 @@ def _run(cmd: list[str], timeout: int = 30) -> tuple[int, str]:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         out = (r.stdout or r.stderr or "").strip().splitlines()
         return r.returncode, out[0] if out else ""
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError) as e:
         return 1, str(e)
 
 
@@ -75,6 +75,33 @@ def _find_global_ruflo() -> str | None:
     cand = Path(out) / "ruflo"
     if cand.exists() and os.access(cand, os.X_OK):
         return str(cand)
+    return None
+
+
+def find_ruflo_skills_dir(cwd: Path | None = None) -> Path | None:
+    """Locate the bundled `.claude/skills` directory inside the resolved ruflo
+    install. Used by rufler to copy extra (standalone) skills that aren't part
+    of `ruflo init skills --<pack>` flags. Returns None when ruflo is only
+    reachable via `npx` (no stable on-disk path) or when the skills dir can't
+    be found."""
+    cmd, source = resolve_ruflo_cmd(cwd)
+    if source == "npx" or not cmd:
+        return None
+    bin_path = Path(cmd[0])
+    try:
+        bin_path = bin_path.resolve()
+    except OSError:
+        return None
+    # The ruflo bin is typically <pkg>/bin/ruflo.js or a symlink pointing there.
+    # Walk up looking for `.claude/skills` — correct for both local
+    # node_modules and global installs.
+    for parent in [bin_path.parent, *bin_path.parents]:
+        candidate = parent / ".claude" / "skills"
+        if candidate.is_dir():
+            return candidate
+        # Stop once we hit node_modules boundary to avoid walking too far.
+        if parent.name == "node_modules":
+            break
     return None
 
 
@@ -137,5 +164,49 @@ def check_ruflo(cwd: Path | None = None) -> CheckResult:
     )
 
 
+def check_skills_sh_cli(deep: bool = False) -> CheckResult:
+    """Report availability of `npx skills` (https://skills.sh).
+
+    skills.sh is **optional** — only needed when `skills.skills_sh` entries
+    appear in the yml. We still surface it in `rufler check` so users know
+    whether the path is wired up.
+
+    `deep=False` (default): fast presence check — just verifies `npx` is on
+    PATH. Used by the always-on `rufler check` table so we don't pay the
+    180s first-run `npx -y skills --help` download on every invocation.
+
+    `deep=True`: actually runs `npx -y skills --help`. Triggered when the
+    yml declares skills.sh entries — rufler refuses to silently skip an
+    install that's about to run.
+    """
+    if not shutil.which("npx"):
+        return CheckResult(
+            "skills.sh",
+            False,
+            hint=(
+                "`npx` not found — install Node.js 20+ so rufler can run "
+                "`npx skills add <repo>`. See https://skills.sh"
+            ),
+        )
+    if not deep:
+        return CheckResult(
+            "skills.sh",
+            True,
+            version="optional — available via npx",
+            source="npx",
+        )
+    code, out = _run(["npx", "-y", "skills", "--help"], timeout=180)
+    if code != 0:
+        return CheckResult(
+            "skills.sh",
+            False,
+            hint=(
+                f"`npx -y skills --help` failed: {out[:200] if out else '(no output)'}. "
+                "Check network / npm registry access. See https://skills.sh"
+            ),
+        )
+    return CheckResult("skills.sh", True, version="skills CLI reachable", source="npx")
+
+
 def check_all(cwd: Path | None = None) -> list[CheckResult]:
-    return [check_node(), check_claude(), check_ruflo(cwd)]
+    return [check_node(), check_claude(), check_ruflo(cwd), check_skills_sh_cli()]

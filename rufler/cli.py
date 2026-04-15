@@ -9,10 +9,42 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from .checks import check_all
-from .config import FlowConfig
+from .checks import find_ruflo_skills_dir
+from .orchestration import init_swarm_stack, print_checks
+from .config import (
+    CLI_FLAG_PACKS,
+    MANUAL_COPY_PACKS,
+    MANUAL_PACK_PREFIXES,
+    FlowConfig,
+    SkillsShEntry,
+)
+from .process import (
+    DEFAULT_FLOW_FILE,
+    DEFAULT_LOG_REL,
+    daemonize,
+    find_claude_procs,
+    fmt_age,
+    human_size,
+    kill_pid_tree,
+    resolve_entry_or_cwd,
+    resolve_log_path,
+    setup_log_for,
+    wait_for_log_end,
+)
 from .registry import Registry, RunEntry, TaskEntry, new_entry, _pid_alive
+from .run_steps import (
+    decompose_task_group,
+    finalize_run,
+    print_run_plan,
+    resolve_exec_overrides,
+)
 from .runner import Runner, ensure_bypass_permissions
+from .skills import (
+    delete_project_skills,
+    fmt_custom_entry,
+    install_skills,
+    render_skills_table,
+)
 from .templates import SAMPLE_FLOW_YML
 
 app = typer.Typer(
@@ -21,9 +53,6 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
-
-DEFAULT_FLOW_FILE = "rufler_flow.yml"
-DEFAULT_LOG_REL = Path(".rufler") / "run.log"
 
 # Hoisted from `ps` list view — used by any command that renders run status.
 STATUS_COLORS = {
@@ -34,174 +63,6 @@ STATUS_COLORS = {
     "dead": "bright_black",
 }
 
-
-def _setup_log_for(run_log: Path) -> Path:
-    """Sibling raw-text log for the daemonized supervisor's stdout/stderr.
-
-    Why a separate file: the NDJSON `run.log` is what `rufler follow` watches.
-    If we dump raw ruflo init/swarm/hive-mind output into it, the file becomes
-    a mix of NDJSON and raw text, the dashboard shows nothing until the claude
-    stream finally starts, and `cat .rufler/run.log` looks broken. Setup goes
-    to `.rufler/setup.log`, the live NDJSON stream stays clean in `run.log`.
-    """
-    return run_log.with_name(run_log.stem + ".setup" + run_log.suffix)
-
-
-def _daemonize(log_path: Path) -> None:
-    """Double-fork into a session leader, redirecting std{in,out,err}.
-
-    docker-like `-d`: caller's parent prints id+log line and `os._exit(0)`s,
-    the grandchild continues as the supervisor with stdout/stderr appended
-    to `log_path`. After this returns we are the grandchild.
-    """
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    if os.fork() > 0:
-        os._exit(0)
-    os.setsid()
-    if os.fork() > 0:
-        os._exit(0)
-    try:
-        devnull = os.open(os.devnull, os.O_RDONLY)
-        os.dup2(devnull, 0)
-        os.close(devnull)
-        log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-        os.dup2(log_fd, 1)
-        os.dup2(log_fd, 2)
-        os.close(log_fd)
-    except OSError:
-        pass
-
-
-def _resolve_log_path(
-    entry: Optional[RunEntry],
-    cli_override: Optional[Path],
-    cwd: Path,
-    yml_log: Optional[Path] = None,
-) -> Path:
-    """Single source of truth for log path resolution across commands.
-
-    Priority: CLI override > registry entry > yml execution.log_file > default.
-    Used by `logs`, `follow`, and `ps <id>` so they all behave the same.
-    """
-    if cli_override is not None:
-        return (cwd / cli_override).resolve()
-    if entry and entry.log_path:
-        return Path(entry.log_path)
-    if yml_log is not None:
-        return yml_log
-    return (cwd / DEFAULT_LOG_REL).resolve()
-
-
-def _resolve_entry_or_cwd(
-    id_or_none: Optional[str],
-    config: Path,
-    *,
-    require_existing_dir: bool = True,
-) -> tuple[Optional[RunEntry], Path, Optional[Path]]:
-    """Resolve a docker-style id prefix against the central registry.
-
-    Returns (entry_or_none, base_dir, log_path_or_none):
-    - If `id_or_none` is given, look it up in the registry and use its
-      base_dir + log_path. Ambiguous prefix → print error + exit.
-      If `require_existing_dir` and the stored base_dir no longer exists,
-      print a clean error and exit (suggests `rufler ps --prune`).
-    - Otherwise fall back to the current directory + the flow file there.
-    """
-    reg = Registry()
-    if id_or_none:
-        matches = reg.find_ambiguous(id_or_none)
-        if not matches:
-            console.print(f"[red]no rufler run matching id[/red] [bold]{id_or_none}[/bold]")
-            console.print("[dim]use [bold]rufler ps -a[/bold] to see all runs[/dim]")
-            raise typer.Exit(1)
-        if len(matches) > 1:
-            console.print(
-                f"[red]id prefix[/red] [bold]{id_or_none}[/bold] "
-                f"[red]is ambiguous — {len(matches)} matches:[/red]"
-            )
-            for e in matches:
-                console.print(f"  [cyan]{e.id}[/cyan]  {e.project}  [dim]{e.base_dir}[/dim]")
-            raise typer.Exit(1)
-        entry = reg.refresh_status(matches[0])
-        base = Path(entry.base_dir)
-        if require_existing_dir and not base.exists():
-            console.print(
-                f"[red]base_dir for run[/red] [cyan]{entry.id}[/cyan] "
-                f"[red]no longer exists:[/red] {base}\n"
-                f"[dim]run [bold]rufler ps --prune[/bold] or "
-                f"[bold]rufler rm {entry.id}[/bold] to clean up[/dim]"
-            )
-            raise typer.Exit(1)
-        return entry, base, Path(entry.log_path) if entry.log_path else None
-    # No id → use current dir / flow file
-    cwd = config.resolve().parent if config.exists() else Path.cwd()
-    log_path: Optional[Path] = None
-    if config.exists():
-        try:
-            cfg = FlowConfig.load(config.resolve())
-            log_path = (cfg.base_dir / cfg.execution.log_file).resolve()
-        except Exception:
-            log_path = None
-    return None, cwd, log_path
-
-
-def _wait_for_log_end(log_path: Path, timeout_sec: int, start_offset: int = 0) -> bool:
-    """Poll log_path for the logwriter's 'log ended' marker, only scanning
-    bytes ADDED after `start_offset`. This avoids false positives from stale
-    'log ended' lines left over from a previous run.
-
-    Returns True when the current run's end-marker is found, False on timeout.
-    """
-    import json as _json
-    deadline = time.time() + timeout_sec
-    last_size = start_offset
-    warned = False
-    while time.time() < deadline:
-        if log_path.exists():
-            try:
-                size = log_path.stat().st_size
-                if size > last_size:
-                    with open(log_path, "rb") as f:
-                        f.seek(last_size)
-                        chunk = f.read(size - last_size).decode("utf-8", errors="replace")
-                    for ln in chunk.splitlines():
-                        ln = ln.strip()
-                        if not ln.startswith("{"):
-                            continue
-                        try:
-                            rec = _json.loads(ln)
-                        except Exception:
-                            continue
-                        text = str(rec.get("text") or "")
-                        if rec.get("src") == "rufler" and text.startswith("log ended"):
-                            return True
-                    last_size = size
-            except Exception as e:
-                if not warned:
-                    console.print(
-                        f"[yellow]warning: log poll error on {log_path}:[/yellow] "
-                        f"[dim]{e}[/dim] (further errors suppressed)"
-                    )
-                    warned = True
-        time.sleep(3)
-    return False
-
-
-def _print_checks() -> bool:
-    results = check_all(Path.cwd())
-    table = Table(title="rufler dependency check")
-    table.add_column("Tool")
-    table.add_column("Status")
-    table.add_column("Source")
-    table.add_column("Version / Hint")
-    all_ok = True
-    for r in results:
-        status = "[green]OK[/green]" if r.ok else "[red]MISSING[/red]"
-        info = r.version or r.hint or ""
-        table.add_row(r.name, status, r.source or "-", info)
-        all_ok = all_ok and r.ok
-    console.print(table)
-    return all_ok
 
 
 @app.command("agents")
@@ -217,7 +78,7 @@ def agents_cmd(
     ),
 ):
     """List agents declared in a rufler flow (name, type, role, prompt preview)."""
-    entry, cwd, _ = _resolve_entry_or_cwd(id_prefix, config, require_existing_dir=False)
+    entry, cwd, _ = resolve_entry_or_cwd(id_prefix, config, console, require_existing_dir=False)
     cfg_path = Path(entry.flow_file) if entry else config.resolve()
     if not cfg_path.exists():
         console.print(
@@ -273,6 +134,94 @@ def agents_cmd(
     console.print(f"[dim]{len(cfg.agents)} agent(s) — use --full to see full prompts[/dim]")
 
 
+@app.command("skills")
+def skills_cmd(
+    id_prefix: Optional[str] = typer.Argument(
+        None, metavar="[ID]", help="Run id from `rufler ps`. Omit to use current dir."
+    ),
+    config: Path = typer.Option(
+        Path(DEFAULT_FLOW_FILE), "--config", "-c", help="Path to rufler_flow.yml"
+    ),
+    available: bool = typer.Option(
+        False, "--available", help="List skills bundled inside ruflo instead of project skills"
+    ),
+    delete: bool = typer.Option(
+        False,
+        "--delete",
+        help="Delete every non-symlinked skill dir under <project>/.claude/skills/. "
+             "Use before `rufler build` to start from a clean slate.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip the confirmation prompt for --delete."
+    ),
+):
+    """List skills installed under `<project>/.claude/skills/` plus the skills
+    configuration declared in rufler_flow.yml. Use --available to see what's
+    shipped inside ruflo's source tree (useful for picking `extra:` names).
+    Use --delete to wipe installed skills (symlinks are preserved)."""
+    entry, _cwd, _ = resolve_entry_or_cwd(id_prefix, config, console, require_existing_dir=False)
+    cfg_path = Path(entry.flow_file) if entry else config.resolve()
+    # Prefer flow file's parent over cwd so `rufler skills -c ../other/flow.yml`
+    # lists the skills actually tied to that project.
+    base_dir = Path(entry.base_dir) if entry else cfg_path.parent
+
+    if delete:
+        delete_project_skills(base_dir, yes, console)
+        return
+
+    if available:
+        src = find_ruflo_skills_dir(base_dir)
+        if src is None:
+            console.print(
+                "[yellow]cannot locate ruflo's bundled .claude/skills[/yellow] "
+                "(likely running via npx). Install ruflo locally or globally."
+            )
+            raise typer.Exit(1)
+        count = render_skills_table(src, title="available skills", console=console)
+        console.print(
+            f"[dim]{count} skill dir(s) — add to `skills.extra` in rufler_flow.yml[/dim]"
+        )
+        return
+
+    # Project skills view — config snapshot first, then installed dirs.
+    if cfg_path.exists():
+        try:
+            cfg = FlowConfig.load(cfg_path)
+            s = cfg.skills
+            pieces = [f"enabled={s.enabled}", f"clean={s.clean}", f"all={s.all}"]
+            if s.packs:
+                pieces.append(f"packs={s.packs}")
+            if s.extra:
+                pieces.append(f"extra={s.extra}")
+            if s.custom:
+                pieces.append(f"custom={[fmt_custom_entry(e) for e in s.custom]}")
+            suffix = " [dim](disabled — `rufler run` will skip install)[/dim]" if not s.enabled else ""
+            console.print(f"[dim]config ({cfg_path.name}):[/dim] {'  '.join(pieces)}{suffix}")
+        except Exception as e:
+            console.print(f"[yellow]flow config unreadable:[/yellow] {e}")
+    else:
+        console.print(f"[dim]no flow file at {cfg_path} — showing installed dirs only[/dim]")
+
+    skills_dir = base_dir / ".claude" / "skills"
+    if not skills_dir.is_dir():
+        console.print(
+            f"[yellow]no skills installed[/yellow] at {skills_dir}. "
+            f"Run [bold]rufler run[/bold] or add skills manually."
+        )
+        raise typer.Exit(0)
+
+    count = render_skills_table(skills_dir, title=f"skills — {base_dir.name}", console=console)
+    if count == 0:
+        console.print(f"[yellow]{skills_dir} is empty[/yellow]")
+    else:
+        console.print(
+            f"[dim]{count} skill(s) in {skills_dir} — "
+            f"use [bold]rufler skills --available[/bold] to see what ruflo ships[/dim]"
+        )
+
+
+
+
 @app.command()
 def check(
     deep: bool = typer.Option(
@@ -280,7 +229,7 @@ def check(
     ),
 ):
     """Verify node, claude code and ruflo are available."""
-    ok = _print_checks()
+    ok = print_checks(console)
     if deep:
         console.rule("[bold]ruflo doctor --fix[/bold]")
         Runner(cwd=Path.cwd()).doctor(fix=True)
@@ -340,7 +289,7 @@ def run_cmd(
     """Validate config, init project, start daemons, launch autonomous swarm."""
     global console
     if not skip_checks:
-        if not _print_checks():
+        if not print_checks(console):
             console.print("[red]Dependency check failed.[/red] Fix above or use --skip-checks.")
             raise typer.Exit(1)
 
@@ -363,68 +312,7 @@ def run_cmd(
         console.print("[red]No agents defined in rufler_flow.yml[/red]")
         raise typer.Exit(1)
 
-    # ---- Resolve task(s) ----
-    # Autogenerated multi: decompose main task into subtasks first.
-    if cfg.task.multi and cfg.task.autogenerated and not cfg.task.group:
-        try:
-            main_body = cfg.task.resolved_main(cfg.base_dir)
-        except FileNotFoundError as e:
-            console.print(f"[red]{e}[/red]")
-            raise typer.Exit(1)
-        if not main_body:
-            console.print(
-                "[red]autogenerated multi: task.main (or main_path) is required[/red]"
-            )
-            raise typer.Exit(1)
-        out_dir = (cfg.base_dir / cfg.task.autogen_dir).resolve()
-        yml_out = (cfg.base_dir / cfg.task.autogen_file).resolve()
-        console.rule(
-            f"[bold]0. decompose main → {cfg.task.autogen_count} subtasks[/bold]"
-        )
-        console.print(f"[dim]claude -p decomposer → {yml_out}[/dim]")
-        # Optional user-supplied decomposer prompt (inline or file)
-        prompt_template: Optional[str] = None
-        if cfg.task.autogen_prompt:
-            prompt_template = cfg.task.autogen_prompt
-        elif cfg.task.autogen_prompt_path:
-            pt_path = (cfg.base_dir / cfg.task.autogen_prompt_path).expanduser().resolve()
-            if not pt_path.exists():
-                console.print(
-                    f"[red]task.autogen_prompt_path not found:[/red] {pt_path}"
-                )
-                raise typer.Exit(1)
-            prompt_template = pt_path.read_text(encoding="utf-8")
-        if prompt_template:
-            console.print("[dim]using custom decomposer prompt from yml[/dim]")
-        try:
-            from .decomposer import decompose
-            written = decompose(
-                main_body,
-                cfg.task.autogen_count,
-                out_dir,
-                yml_out,
-                prompt_template=prompt_template,
-            )
-        except Exception as e:
-            console.print(f"[red]decomposer failed:[/red] {e}")
-            raise typer.Exit(1)
-        # Merge generated items into cfg.task.group.
-        # `w["file_path"]` is relative to the companion yml's directory; we
-        # resolve it to an absolute path so TaskItem.resolved() (which joins
-        # against cfg.base_dir) picks up the file correctly regardless of
-        # where autogen_dir sits.
-        from .config import TaskItem as _TI
-        cfg.task.group = [
-            _TI(
-                name=w["name"],
-                file_path=str((yml_out.parent / w["file_path"]).resolve()),
-            )
-            for w in written
-        ]
-        console.print(
-            f"[green]generated {len(written)} subtasks[/green] → "
-            + ", ".join(w["name"] for w in written)
-        )
+    decompose_task_group(cfg, console)
 
     try:
         tasks = cfg.task.iter_tasks(cfg.base_dir)
@@ -438,38 +326,7 @@ def run_cmd(
         )
         raise typer.Exit(1)
 
-    # ---- Plan ----
-    mode_label = (
-        f"multi ({cfg.task.run_mode}, {len(tasks)} tasks)"
-        if cfg.task.multi
-        else "mono (1 task)"
-    )
-    console.rule("[bold]Plan[/bold]")
-    console.print(f"Project : [cyan]{cfg.project.name}[/cyan]")
-    console.print(f"Mode    : [cyan]{mode_label}[/cyan]")
-    console.print(
-        f"Agents  : [cyan]{len(cfg.agents)}[/cyan]  "
-        f"({', '.join(a.name for a in cfg.agents)})"
-    )
-    console.print(
-        f"Swarm   : topology={cfg.swarm.topology} "
-        f"max_agents={cfg.swarm.max_agents} strategy={cfg.swarm.strategy} "
-        f"consensus={cfg.swarm.consensus}"
-    )
-    console.print(
-        f"Memory  : backend={cfg.memory.backend} namespace={cfg.memory.namespace} "
-        f"init={cfg.memory.init}"
-    )
-    console.print(
-        f"Exec    : background={cfg.execution.background} "
-        f"non_interactive={cfg.execution.non_interactive} "
-        f"yolo={cfg.execution.yolo}"
-    )
-    console.rule("[bold]Tasks[/bold]")
-    for i, (tname, tbody) in enumerate(tasks, 1):
-        preview = tbody.splitlines()[0][:90] if tbody else "(empty)"
-        console.print(f"[cyan]{i}.[/cyan] [bold]{tname}[/bold] — [dim]{preview}[/dim]")
-    console.rule()
+    print_run_plan(cfg, tasks, console)
 
     if dry_run:
         console.print("[yellow]dry-run: stopping before executing ruflo[/yellow]")
@@ -478,37 +335,35 @@ def run_cmd(
     runner = Runner(cwd=cfg.base_dir)
     base_task_id = f"rufler-{cfg.project.name}-{int(time.time())}"
 
-    # Merge execution settings early: CLI flag wins, else yml, else default.
-    # Done BEFORE registry creation so the registry entry gets the real mode
-    # and the effective log path from the start.
-    eff_background = background if background is not None else cfg.execution.background
-    eff_non_interactive = (
-        non_interactive if non_interactive is not None else cfg.execution.non_interactive
-    )
-    eff_yolo = yolo if yolo is not None else cfg.execution.yolo
-    eff_log_file = log_file if log_file is not None else Path(cfg.execution.log_file)
-    if eff_background:
-        eff_non_interactive = True
-        eff_yolo = True
+    eff = resolve_exec_overrides(cfg, background, non_interactive, yolo, log_file)
 
     # Central registry entry — one per `rufler run` invocation.
     registry = Registry()
-    primary_log_path = (cfg.base_dir / eff_log_file).resolve()
+    primary_log_path = (cfg.base_dir / eff.log_file).resolve()
     reg_entry = new_entry(
         project=cfg.project.name,
         flow_file=cfg_path,
         base_dir=cfg.base_dir,
-        mode="background" if eff_background else "foreground",
+        mode="background" if eff.background else "foreground",
         run_mode=cfg.task.run_mode if cfg.task.multi else "sequential",
         log_path=primary_log_path,
     )
     registry.add(reg_entry)
 
+    def _register_self_pid() -> None:
+        # Record the current pid as the run's supervisor pid so `rufler ps` /
+        # `rufler stop` can find us. MUST be called after daemonize() in the
+        # background case — the grandchild has a new pid.
+        from .registry import _pid_starttime
+        reg_entry.pids = [os.getpid()]
+        reg_entry.pid_starttimes = [_pid_starttime(os.getpid()) or 0]
+        registry.update(reg_entry)
+
     # docker-like `-d`: print id+log to the user's terminal, then fully detach.
     # Parent exits immediately; grandchild becomes the supervisor and runs the
     # rest of run_cmd with stdout/stderr appended to the run log.
-    if eff_background:
-        setup_log_path = _setup_log_for(primary_log_path)
+    if eff.background:
+        setup_log_path = setup_log_for(primary_log_path)
         console.print(
             f"[bold green]rufler started in background[/bold green]  "
             f"[cyan]{reg_entry.id}[/cyan]  [dim]log={primary_log_path}[/dim]"
@@ -521,54 +376,23 @@ def run_cmd(
             f"[bold]rufler follow {reg_entry.id}[/bold] / "
             f"[bold]rufler logs {reg_entry.id}[/bold].[/dim]"
         )
-        _daemonize(setup_log_path)
-        # We are the grandchild now. Record our pid as the supervisor pid so
-        # `rufler ps` and `rufler stop` can find us.
-        from .registry import _pid_starttime as _pst
-        reg_entry.pids = [os.getpid()]
-        reg_entry.pid_starttimes = [_pst(os.getpid()) or 0]
-        registry.update(reg_entry)
+        daemonize(setup_log_path)
+        _register_self_pid()
         # Rebind module-level console so any rich output goes to the log file
         # (the existing global Console captured the old stdout fd at import).
         import sys as _sys
         console = Console(file=_sys.stdout, force_terminal=False, soft_wrap=True)
     else:
-        reg_entry.pids = [os.getpid()]
-        from .registry import _pid_starttime as _pst
-        reg_entry.pid_starttimes = [_pst(os.getpid()) or 0]
-        registry.update(reg_entry)
+        _register_self_pid()
         console.print(
             f"[bold green]rufler id:[/bold green] [cyan]{reg_entry.id}[/cyan]  "
             f"[dim](use: rufler logs {reg_entry.id} | rufler follow {reg_entry.id} | "
             f"rufler stop {reg_entry.id})[/dim]"
         )
 
-    if not skip_init:
-        console.rule("[bold]1. ruflo init + daemon[/bold]")
-        runner.init_project(start_daemon=True)
-        if cfg.memory.init:
-            runner.memory_init(backend=cfg.memory.backend)
+    init_swarm_stack(runner, cfg, console, skip_init)
 
-    console.rule("[bold]2. swarm init[/bold]")
-    runner.swarm_init(cfg.swarm.topology, cfg.swarm.max_agents, cfg.swarm.strategy)
-
-    console.rule("[bold]3. hive-mind init[/bold]")
-    runner.hive_init(
-        topology=cfg.swarm.topology,
-        consensus=cfg.swarm.consensus,
-        max_agents=cfg.swarm.max_agents,
-        memory_backend=cfg.memory.backend,
-    )
-
-    if cfg.task.autonomous:
-        console.rule("[bold]4. autopilot enable[/bold]")
-        runner.autopilot_config(
-            max_iterations=cfg.task.max_iterations,
-            timeout_minutes=cfg.task.timeout_minutes,
-        )
-        runner.autopilot_enable()
-
-    if eff_yolo:
+    if eff.yolo:
         settings_path = ensure_bypass_permissions(cfg.base_dir)
         console.print(
             f"[dim]yolo: wrote permissions.defaultMode=bypassPermissions → "
@@ -577,7 +401,7 @@ def run_cmd(
 
     # Parallel multi-task only makes sense in background — each task blocks
     # the terminal otherwise, which is effectively sequential.
-    if cfg.task.multi and cfg.task.run_mode == "parallel" and not eff_background:
+    if cfg.task.multi and cfg.task.run_mode == "parallel" and not eff.background:
         console.print(
             "[yellow]warning:[/yellow] run_mode=parallel with foreground "
             "execution runs tasks one after another (terminal blocks). "
@@ -586,25 +410,25 @@ def run_cmd(
 
     console.rule("[bold]5. hive-mind spawn --claude[/bold]")
     console.print(
-        f"[dim]mode: background={eff_background} non_interactive={eff_non_interactive} "
-        f"yolo={eff_yolo} run_mode={cfg.task.run_mode} tasks={len(tasks)}[/dim]"
+        f"[dim]mode: background={eff.background} non_interactive={eff.non_interactive} "
+        f"yolo={eff.yolo} run_mode={cfg.task.run_mode} tasks={len(tasks)}[/dim]"
     )
     def _log_path_for(tname: str) -> Path:
         # Per-task log in multi mode so parallel runs don't collide.
         if len(tasks) > 1:
             return (
                 cfg.base_dir
-                / eff_log_file.parent
-                / f"{eff_log_file.stem}.{tname}{eff_log_file.suffix}"
+                / eff.log_file.parent
+                / f"{eff.log_file.stem}.{tname}{eff.log_file.suffix}"
             ).resolve()
-        return (cfg.base_dir / eff_log_file).resolve()
+        return (cfg.base_dir / eff.log_file).resolve()
 
     def _spawn_one(idx: int, tname: str, tbody: str) -> None:
         objective = cfg.build_objective(task_body=tbody, task_name=tname)
         task_id = f"{base_task_id}-{tname}"
         runner.hooks_pre_task(task_id=task_id, description=tbody[:500])
         log_path = _log_path_for(tname)
-        if eff_background:
+        if eff.background:
             pid = runner.hive_spawn_claude(
                 count=len(cfg.agents),
                 objective=objective,
@@ -632,8 +456,8 @@ def run_cmd(
                 count=len(cfg.agents),
                 objective=objective,
                 role="specialist",
-                non_interactive=eff_non_interactive,
-                skip_permissions=eff_yolo,
+                non_interactive=eff.non_interactive,
+                skip_permissions=eff.yolo,
                 log_path=log_path,
                 detach=False,
             )
@@ -651,7 +475,7 @@ def run_cmd(
             for i, (tname, tbody) in enumerate(tasks, 1):
                 console.print(f"\n[bold cyan]━ [{i}/{len(tasks)}] {tname}[/bold cyan]")
                 pre_spawn_size = 0
-                if eff_background:
+                if eff.background:
                     lp = _log_path_for(tname)
                     if lp.exists():
                         try:
@@ -659,11 +483,12 @@ def run_cmd(
                         except OSError:
                             pre_spawn_size = 0
                 _spawn_one(i, tname, tbody)
-                if eff_background and i < len(tasks):
+                if eff.background and i < len(tasks):
                     console.print(f"[dim]waiting for {tname} to finish...[/dim]")
-                    _wait_for_log_end(
+                    wait_for_log_end(
                         _log_path_for(tname),
                         cfg.task.timeout_minutes * 60,
+                        console,
                         start_offset=pre_spawn_size,
                     )
     except KeyboardInterrupt:
@@ -673,10 +498,10 @@ def run_cmd(
         # In -d mode we never reach here during the spawn loop for already-
         # detached children, but guard anyway so we don't nuke unrelated procs.
         console.print("\n[yellow]interrupted — cleaning up[/yellow]")
-        if not eff_background:
+        if not eff.background:
             try:
                 import signal
-                for p in _find_claude_procs(cfg.base_dir):
+                for p in find_claude_procs(cfg.base_dir):
                     try:
                         os.kill(int(p.get("pid", 0)), signal.SIGTERM)
                     except (ProcessLookupError, PermissionError, ValueError, OSError):
@@ -690,31 +515,101 @@ def run_cmd(
             pass
         raise typer.Exit(130)
 
-    # Mark finished + count tokens for both modes. In `-d` we are the
-    # detached grandchild here, so this runs after every spawned task has
-    # actually completed (sequential) or fired (parallel).
-    reg_entry.finished_at = time.time()
-    try:
-        registry.update(reg_entry)
-    except Exception:
-        pass
-    try:
-        registry.recompute_tokens(reg_entry)
-    except Exception as e:
-        console.print(f"[dim]token accounting skipped: {e}[/dim]")
-    from .tokens import fmt_tokens as _ft
-    console.print(
-        f"\n[green bold]rufler run complete[/green bold]  "
-        f"[dim]id={reg_entry.id} task_id={base_task_id} "
-        f"tokens={_ft(reg_entry.total_tokens)}[/dim]"
-    )
-    if eff_background:
+    # In `-d` we are the detached grandchild here, so this runs after every
+    # spawned task has actually completed (sequential) or fired (parallel).
+    finalize_run(reg_entry, registry, base_task_id, console)
+    if eff.background:
         # Daemon supervisor is done — exit cleanly without Typer postprocessing.
         os._exit(0)
 
 
 app.command("run", help="Run a rufler flow (foreground; -d to detach, like docker run).")(run_cmd)
 app.command("start", hidden=True, help="Deprecated alias for `rufler run`.")(run_cmd)
+
+
+@app.command("build")
+def build_cmd(
+    flow_file: Optional[Path] = typer.Argument(
+        None,
+        metavar="[FLOW_FILE]",
+        help="Path to flow yml (positional). Overrides --config and default rufler_flow.yml.",
+    ),
+    config: Path = typer.Option(
+        Path(DEFAULT_FLOW_FILE), "--config", "-c", help="Path to rufler_flow.yml"
+    ),
+    skip_checks: bool = typer.Option(False, "--skip-checks"),
+    skip_init: bool = typer.Option(
+        False, "--skip-init", help="Skip ruflo init + daemon + memory init"
+    ),
+):
+    """Apply rufler_flow.yml to the project WITHOUT launching the swarm.
+
+    Runs the same preparation steps as `rufler run` — ruflo init + daemon,
+    memory init, skills install (packs + extra + custom), swarm init,
+    hive-mind init, autopilot config — but stops before spawning Claude Code.
+    Use after editing the yml (new agents, changed memory, added/removed
+    skills) to re-sync ruflo state; then `rufler run` to actually start.
+    """
+    global console
+    if not skip_checks:
+        if not print_checks(console):
+            console.print("[red]Dependency check failed.[/red] Fix above or use --skip-checks.")
+            raise typer.Exit(1)
+
+    cfg_path = (flow_file if flow_file is not None else config).resolve()
+    if not cfg_path.exists():
+        console.print(
+            f"[red]{cfg_path} not found.[/red] Run [bold]rufler init[/bold] first "
+            f"or pass a flow file: [bold]rufler build path/to/flow.yml[/bold]."
+        )
+        raise typer.Exit(1)
+
+    try:
+        cfg = FlowConfig.load(cfg_path)
+    except Exception as e:
+        console.print(f"[red]Failed to load config:[/red] {e}")
+        raise typer.Exit(1)
+
+    if not cfg.agents:
+        console.print("[yellow]no agents defined — build will still prep ruflo state[/yellow]")
+
+    console.rule("[bold]Plan (build only)[/bold]")
+    console.print(f"Project : [cyan]{cfg.project.name}[/cyan]")
+    console.print(
+        f"Agents  : [cyan]{len(cfg.agents)}[/cyan]"
+        + (f"  ({', '.join(a.name for a in cfg.agents)})" if cfg.agents else "")
+    )
+    console.print(
+        f"Swarm   : topology={cfg.swarm.topology} "
+        f"max_agents={cfg.swarm.max_agents} strategy={cfg.swarm.strategy} "
+        f"consensus={cfg.swarm.consensus}"
+    )
+    console.print(
+        f"Memory  : backend={cfg.memory.backend} namespace={cfg.memory.namespace} "
+        f"init={cfg.memory.init}"
+    )
+    s = cfg.skills
+    skill_pieces = [f"enabled={s.enabled}"]
+    if s.all:
+        skill_pieces.append("all=true")
+    if s.packs:
+        skill_pieces.append(f"packs={s.packs}")
+    if s.extra:
+        skill_pieces.append(f"extra={s.extra}")
+    if s.custom:
+        skill_pieces.append(f"custom={[fmt_custom_entry(e) for e in s.custom]}")
+    console.print(f"Skills  : {'  '.join(skill_pieces)}")
+    console.rule()
+
+    runner = Runner(cwd=cfg.base_dir)
+
+    init_swarm_stack(runner, cfg, console, skip_init)
+
+    console.rule()
+    console.print(
+        "[bold green]build complete[/bold green] — ruflo state is synced with "
+        f"[cyan]{cfg_path.name}[/cyan]. Run [bold]rufler run[/bold] to spawn the swarm."
+    )
 
 
 @app.command()
@@ -727,7 +622,7 @@ def status(
     ),
 ):
     """Show full ruflo status: system + swarm + hive-mind + autopilot."""
-    _, cwd, _ = _resolve_entry_or_cwd(id_prefix, config)
+    _, cwd, _ = resolve_entry_or_cwd(id_prefix, config, console)
     r = Runner(cwd=cwd)
     console.rule("[bold]system[/bold]")
     r.system_status()
@@ -748,7 +643,7 @@ def watch(
     interval: int = typer.Option(10, "--interval", "-i", help="Seconds between refreshes"),
 ):
     """Poll `rufler status` on a loop until Ctrl-C."""
-    _, cwd, _ = _resolve_entry_or_cwd(id_prefix, config)
+    _, cwd, _ = resolve_entry_or_cwd(id_prefix, config, console)
     r = Runner(cwd=cwd)
     try:
         while True:
@@ -786,9 +681,9 @@ def logs(
 
     With `-f` / `--follow` the run log is streamed live (Ctrl+C to stop).
     """
-    entry, cwd, yml_log = _resolve_entry_or_cwd(id_prefix, config)
+    entry, cwd, yml_log = resolve_entry_or_cwd(id_prefix, config, console)
     if follow or raw:
-        lp = _resolve_log_path(entry, None, cwd, yml_log)
+        lp = resolve_log_path(entry, None, cwd, yml_log)
         if not lp.exists() and not follow:
             console.print(f"[yellow]log not found:[/yellow] {lp}")
             raise typer.Exit(1)
@@ -862,7 +757,7 @@ def progress(
     ),
 ):
     """Show autopilot task progress + recent iteration log."""
-    _, cwd, _ = _resolve_entry_or_cwd(id_prefix, config)
+    _, cwd, _ = resolve_entry_or_cwd(id_prefix, config, console)
     r = Runner(cwd=cwd)
     console.rule("[bold]autopilot status[/bold]")
     r.autopilot_status()
@@ -871,367 +766,6 @@ def progress(
     if query:
         console.rule(f"[bold]autopilot history[/bold] [dim]query={query!r}[/dim]")
         r.autopilot_history(query=query, limit=last)
-
-
-def _human_size(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
-        n /= 1024
-    return f"{n:.1f}TB"
-
-
-def _find_claude_procs(project_dir: Path) -> list[dict]:
-    """Return live `claude -p` processes whose working dir is inside project_dir.
-
-    Linux-only (relies on /proc/<pid>/cwd). On other platforms returns [].
-    """
-    if not Path("/proc").is_dir():
-        return []
-    import subprocess as sp
-
-    try:
-        out = sp.run(
-            ["ps", "-eo", "pid,etime,command"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        ).stdout
-    except Exception:
-        return []
-
-    procs: list[dict] = []
-    target = str(project_dir.resolve())
-    for line in out.splitlines()[1:]:
-        parts = line.strip().split(None, 2)
-        if len(parts) < 3:
-            continue
-        pid_s, etime, cmd = parts
-        if "claude -p" not in cmd:
-            continue
-        try:
-            cwd = Path(f"/proc/{pid_s}/cwd").resolve()
-        except Exception:
-            continue
-        if not str(cwd).startswith(target):
-            continue
-        procs.append({"pid": int(pid_s), "etime": etime, "cmd": cmd[:80]})
-    return procs
-
-
-def _fmt_age(ts: Optional[float]) -> str:
-    if ts is None or ts <= 0:
-        return "-"
-    secs = max(0, int(time.time() - ts))
-    if secs < 60:
-        return f"{secs}s"
-    if secs < 3600:
-        return f"{secs // 60}m{secs % 60}s"
-    if secs < 86400:
-        return f"{secs // 3600}h{(secs % 3600) // 60}m"
-    return f"{secs // 86400}d{(secs % 86400) // 3600}h"
-
-
-@app.command()
-def ps(
-    id_prefix: Optional[str] = typer.Argument(
-        None,
-        metavar="[ID]",
-        help="Optional run id to inspect. Omit to list runs (docker-like).",
-    ),
-    all_: bool = typer.Option(
-        False, "-a", "--all", help="Show all runs including exited ones"
-    ),
-    prune: bool = typer.Option(
-        False, "--prune", help="Drop registry entries whose base_dir no longer exists"
-    ),
-    prune_older_than_days: Optional[int] = typer.Option(
-        None,
-        "--prune-older-than-days",
-        help="Also drop finished entries older than N days",
-    ),
-    config: Path = typer.Option(
-        Path(DEFAULT_FLOW_FILE), "--config", "-c", help="Path to rufler_flow.yml"
-    ),
-    log_file: Optional[Path] = typer.Option(
-        None, "--log-file", help="Override log path for per-project inspection"
-    ),
-):
-    """List rufler runs (like `docker ps`) or inspect one by id.
-
-    - `rufler ps` → running runs from all projects
-    - `rufler ps -a` → all runs (running + exited)
-    - `rufler ps <id>` → detailed view (processes, log tail, hive session)
-    """
-    registry = Registry()
-    if prune or prune_older_than_days is not None:
-        removed = registry.prune(
-            missing_dirs=True,
-            older_than_sec=(
-                prune_older_than_days * 86400 if prune_older_than_days is not None else None
-            ),
-        )
-        console.print(f"[dim]pruned {removed} stale entries[/dim]")
-
-    # No id → list view (docker ps)
-    if not id_prefix:
-        entries = registry.list_refreshed(include_all=all_)
-        if not entries:
-            console.print(
-                "[yellow]no "
-                + ("runs" if all_ else "running runs")
-                + "[/yellow] — use [bold]rufler run[/bold] to launch one"
-            )
-            return
-        from .tokens import fmt_tokens
-        t = Table(show_header=True, header_style="bold")
-        t.add_column("ID")
-        t.add_column("PROJECT")
-        t.add_column("MODE")
-        t.add_column("STATUS")
-        t.add_column("TASKS", justify="right")
-        t.add_column("CREATED")
-        t.add_column("LAST RUN")
-        t.add_column("TOKENS", justify="right", style="magenta")
-        t.add_column("BASE DIR")
-        for e in entries:
-            status_color = STATUS_COLORS.get(e.status, "white")
-            # Docker-style status labels with a relative duration hint.
-            if e.status == "running":
-                status_label = f"Up {_fmt_age(e.started_at)}"
-            elif e.status in ("exited", "failed") and e.exit_code is not None:
-                rc = e.exit_code
-                base = "Exited" if e.status == "exited" else "Failed"
-                ago = _fmt_age(e.finished_at) if e.finished_at else "?"
-                status_label = f"{base} ({rc}) {ago} ago"
-            elif e.status == "stopped":
-                ago = _fmt_age(e.finished_at) if e.finished_at else "?"
-                status_label = f"Stopped {ago} ago"
-            elif e.status == "dead":
-                status_label = "Dead"
-            else:
-                status_label = e.status
-            # LAST RUN = when the run last changed state (finished_at if set,
-            # else started_at for live runs).
-            last_run_ts = e.finished_at if e.finished_at else e.started_at
-            t.add_row(
-                e.id,
-                e.project,
-                e.mode,
-                f"[{status_color}]{status_label}[/{status_color}]",
-                str(len(e.tasks)) or "1",
-                _fmt_age(e.started_at),
-                _fmt_age(last_run_ts),
-                fmt_tokens(e.total_tokens) if e.total_tokens else "-",
-                e.base_dir,
-            )
-        console.print(t)
-        return
-
-    # Id given → detailed view
-    entry, cwd, yml_log = _resolve_entry_or_cwd(id_prefix, config)
-    log_path = _resolve_log_path(entry, log_file, cwd, yml_log)
-
-    if entry:
-        console.rule(f"[bold]run[/bold] [cyan]{entry.id}[/cyan]  [dim]{entry.project}[/dim]")
-        console.print(
-            f"status : [bold]{entry.status}[/bold]"
-            + (f" (rc={entry.exit_code})" if entry.exit_code is not None else "")
-        )
-        console.print(f"mode   : {entry.mode} ({entry.run_mode})")
-        console.print(f"base   : {entry.base_dir}")
-        console.print(f"flow   : {entry.flow_file}")
-        console.print(f"age    : {_fmt_age(entry.started_at)}")
-        if entry.tasks:
-            console.print(f"tasks  : {len(entry.tasks)}")
-            for tt in entry.tasks:
-                console.print(
-                    f"  • [cyan]{tt.name}[/cyan]  [dim]pid={tt.pid} log={tt.log_path}[/dim]"
-                )
-
-    # 1) Live claude processes
-    console.rule("[bold]live claude processes[/bold]")
-    procs = _find_claude_procs(cwd)
-    if not procs:
-        console.print("[yellow]no running `claude -p` child under this project[/yellow]")
-    else:
-        t = Table(show_header=True, header_style="bold")
-        t.add_column("PID", justify="right")
-        t.add_column("Uptime")
-        t.add_column("Command")
-        for p in procs:
-            t.add_row(str(p["pid"]), p["etime"], p["cmd"])
-        console.print(t)
-
-    # 2) Log summary
-    console.rule("[bold]run log[/bold]")
-    if not log_path.exists():
-        console.print(f"[yellow]log not found:[/yellow] {log_path}")
-    else:
-        size = log_path.stat().st_size
-        mtime = time.strftime("%H:%M:%S", time.localtime(log_path.stat().st_mtime))
-        console.print(
-            f"path : [cyan]{log_path}[/cyan]\nsize : {_human_size(size)}   "
-            f"modified: {mtime}"
-        )
-        try:
-            # read last ~4KB, show last 5 non-empty lines
-            with open(log_path, "rb") as f:
-                f.seek(max(0, size - 4096))
-                tail = f.read().decode("utf-8", errors="replace")
-            last_lines = [ln for ln in tail.splitlines() if ln.strip()][-5:]
-            if last_lines:
-                console.rule("[dim]last lines[/dim]")
-                for ln in last_lines:
-                    console.print(f"[dim]{ln[:200]}[/dim]")
-        except Exception as e:
-            console.print(f"[red]failed to tail:[/red] {e}")
-
-    # 3) Hive-mind session files
-    console.rule("[bold]hive-mind sessions[/bold]")
-    sess_dir = cwd / ".hive-mind" / "sessions"
-    if not sess_dir.exists():
-        console.print(f"[yellow]no session dir:[/yellow] {sess_dir}")
-    else:
-        files = sorted(
-            sess_dir.glob("hive-mind-prompt-*.txt"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )[:3]
-        if not files:
-            console.print("[yellow]no hive session files[/yellow]")
-        else:
-            for f in files:
-                mtime = time.strftime("%H:%M:%S", time.localtime(f.stat().st_mtime))
-                sid = f.stem.replace("hive-mind-prompt-", "")
-                console.print(
-                    f"[cyan]{sid}[/cyan]  [dim]{_human_size(f.stat().st_size)} "
-                    f"@ {mtime}[/dim]"
-                )
-
-
-@app.command()
-def follow(
-    id_prefix: Optional[str] = typer.Argument(
-        None, metavar="[ID]", help="Run id from `rufler ps`. Omit to use current dir."
-    ),
-    config: Path = typer.Option(
-        Path(DEFAULT_FLOW_FILE), "--config", "-c", help="Path to rufler_flow.yml"
-    ),
-    log_file: Optional[Path] = typer.Option(
-        None, "--log-file", help="Override log path"
-    ),
-):
-    """Follow the NDJSON run log live — pretty dashboard of session state,
-    tasks, tokens, last tool activity, recent events. Think `tail -f` with makeup."""
-    from .follow import follow as _follow
-
-    entry, cwd, yml_log = _resolve_entry_or_cwd(id_prefix, config)
-    log_path = _resolve_log_path(entry, log_file, cwd, yml_log)
-
-    # Multi-task mode: each subtask writes NDJSON to its own per-task log,
-    # so the entry's "primary" log mostly captures init/setup chatter that
-    # is not NDJSON. Prefer the most recently appended per-task log so the
-    # dashboard actually shows the running claude stream.
-    if log_file is None and entry and entry.tasks:
-        candidates = []
-        for t in entry.tasks:
-            if not t.log_path:
-                continue
-            tp = Path(t.log_path)
-            try:
-                mtime = tp.stat().st_mtime if tp.exists() else 0
-            except OSError:
-                mtime = 0
-            candidates.append((mtime, tp))
-        if candidates:
-            candidates.sort(reverse=True)
-            best = candidates[0][1]
-            if best.exists() or not log_path.exists():
-                log_path = best
-
-    console.print(f"[dim]watching {log_path} — Ctrl-C to exit[/dim]")
-    _follow(log_path)
-
-
-def _kill_pid_tree(pid: int, sig) -> int:
-    """SIGTERM `pid`, its whole session/process group, and every descendant
-    we can find via /proc walk.
-
-    Returns the count of signals we tried to send. Linux-only descendant walk;
-    on non-Linux we still signal `pid` itself.
-
-    Why both killpg AND a /proc walk:
-    - rufler's `-d` supervisor and each spawned logwriter call `os.setsid()` /
-      `start_new_session=True`, so they're session/process-group leaders. Many
-      of their children (`claude -p`, node, mcp helpers) detach further and
-      reparent to init — they're invisible to a ppid-based descendant walk but
-      `killpg(<leader>, sig)` still reaches them because they kept the pgid.
-    - Conversely, processes that fork off into their own pgid won't get the
-      killpg signal, so the /proc walk catches the rest.
-    """
-    sent = 0
-    # Signal the whole process group first. If `pid` is a session/pgid leader
-    # this is the only thing that reaches detached `claude -p` descendants.
-    try:
-        os.killpg(pid, sig)
-        sent += 1
-    except ProcessLookupError:
-        pass
-    except PermissionError:
-        pass
-    except OSError:
-        pass
-
-    def _children(parent: int) -> list[int]:
-        kids: list[int] = []
-        proc = Path("/proc")
-        if not proc.is_dir():
-            return kids
-        for d in proc.iterdir():
-            if not d.name.isdigit():
-                continue
-            try:
-                with open(d / "stat", "rb") as f:
-                    raw = f.read().decode("utf-8", errors="replace")
-            except OSError:
-                continue
-            rp = raw.rfind(")")
-            if rp < 0:
-                continue
-            parts = raw[rp + 2 :].split()
-            if len(parts) < 2:
-                continue
-            try:
-                ppid = int(parts[1])
-            except ValueError:
-                continue
-            if ppid == parent:
-                kids.append(int(d.name))
-        return kids
-
-    # BFS through descendants, signal leaves first then up.
-    order: list[int] = []
-    stack = [pid]
-    seen: set[int] = set()
-    while stack:
-        p = stack.pop()
-        if p in seen:
-            continue
-        seen.add(p)
-        order.append(p)
-        stack.extend(_children(p))
-    for p in reversed(order):
-        try:
-            os.kill(p, sig)
-            sent += 1
-        except ProcessLookupError:
-            continue
-        except PermissionError:
-            continue
-        except OSError:
-            continue
-    return sent
 
 
 @app.command()
@@ -1274,8 +808,8 @@ def stop(
     import signal as _sig
     # If base_dir is gone we still want to kill pids + mark the entry finished,
     # so we tolerate a missing directory here.
-    entry, cwd, _ = _resolve_entry_or_cwd(
-        id_prefix, config, require_existing_dir=False
+    entry, cwd, _ = resolve_entry_or_cwd(
+        id_prefix, config, console, require_existing_dir=False
     )
 
     # Without an explicit id, _resolve_entry_or_cwd may return entry=None
@@ -1308,7 +842,7 @@ def stop(
         pids: list[int] = list(entry_obj.pids or [])
         # Also collect lingering claude children we know about by cwd.
         try:
-            for p in _find_claude_procs(Path(entry_obj.base_dir)):
+            for p in find_claude_procs(Path(entry_obj.base_dir)):
                 pid = int(p.get("pid") or 0)
                 if pid and pid not in pids:
                     pids.append(pid)
@@ -1318,7 +852,7 @@ def stop(
             return
         sent_total = 0
         for pid in pids:
-            n = _kill_pid_tree(pid, _sig.SIGTERM)
+            n = kill_pid_tree(pid, _sig.SIGTERM)
             if n:
                 sent_total += n
         if sent_total:
@@ -1337,7 +871,7 @@ def stop(
         # Also re-scan for any `claude -p` still under base_dir — they may have
         # reparented and survived the first sweep.
         try:
-            for p in _find_claude_procs(Path(entry_obj.base_dir)):
+            for p in find_claude_procs(Path(entry_obj.base_dir)):
                 pid = int(p.get("pid") or 0)
                 if pid and pid not in leftover and _pid_alive(pid):
                     leftover.append(pid)
@@ -1346,7 +880,7 @@ def stop(
         if leftover:
             killed = 0
             for pid in leftover:
-                killed += _kill_pid_tree(pid, _sig.SIGKILL)
+                killed += kill_pid_tree(pid, _sig.SIGKILL)
             if killed:
                 console.print(
                     f"[red]SIGKILL fallback:[/red] {killed} process(es) refused SIGTERM"
@@ -1532,7 +1066,7 @@ def projects_cmd():
 
     grand = {"in": 0, "out": 0, "cr": 0, "cc": 0}
     for p in projs:
-        age = _fmt_age(p.last_started_at) if p.last_started_at else "-"
+        age = fmt_age(p.last_started_at) if p.last_started_at else "-"
         last_id = p.last_run_id or "-"
         base = p.last_base_dir or "-"
         if base != "-" and not Path(base).exists():
@@ -1582,7 +1116,7 @@ def tokens_cmd(
     reg = Registry()
 
     if id_prefix:
-        entry, _, _ = _resolve_entry_or_cwd(id_prefix, Path(DEFAULT_FLOW_FILE), require_existing_dir=False)
+        entry, _, _ = resolve_entry_or_cwd(id_prefix, Path(DEFAULT_FLOW_FILE), console, require_existing_dir=False)
         if entry is None:
             console.print(f"[red]no run matching[/red] [bold]{id_prefix}[/bold]")
             raise typer.Exit(1)

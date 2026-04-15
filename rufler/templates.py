@@ -39,6 +39,41 @@ execution:
                             #         (background also forces non_interactive + yolo)
   log_file: .rufler/run.log
 
+# Global Claude Code skills installed into .claude/skills/ before the swarm runs.
+# Proxied to `ruflo init skills --<pack>` for core/agentdb/github/v3; other
+# packs + `extra` are copied from ruflo's bundled source tree.
+skills:
+  enabled: true
+  clean: false              # false = keep ruflo init's ~30 default skills alongside
+                            # anything declared here (default). Set true to wipe
+                            # non-symlinked skill dirs after `ruflo init` so
+                            # .claude/skills/ matches this yml exactly.
+  all: false                # true = install every pack (overrides `packs`)
+  packs: []                 # core | agentdb | github | flowNexus | browser | v3 | dualMode
+  extra: []                 # individual skill dir names under ruflo's .claude/skills/
+  custom: []                # Unified list — each entry is one of:
+                            #   1. local path     — abs, ~, or relative to this yml,
+                            #                       copied to .claude/skills/<basename>
+                            #   2. pasted command — full `npx skills add <source> [flags]`
+                            #                       line from https://skills.sh (easiest)
+                            #   3. dict form      — {source, skill?, agent?, copy?} for
+                            #                       explicit control over skills.sh install
+                            # Resolution: rufler tries the filesystem first; if the
+                            # string isn't an existing directory it falls back to a
+                            # skills.sh install via `npx skills add`.
+                            # Example:
+                            #   custom:
+                            #     - ./skills/my-skill                     # local dir
+                            #     - ~/shared/claude-skills/awesome        # local dir
+                            #     - npx skills add https://github.com/samber/cc-skills-golang --skill golang-error-handling
+                            #     - source: vercel-labs/skills            # dict form
+                            #       skill: azure-ai
+                            #       agent: claude-code
+                            #       copy: true
+                            # `rufler check` probes `npx skills --help` when any
+                            # entry resolves to a skills.sh install so missing
+                            # npx/network fails fast before `rufler run`.
+
 agents:
   - name: architect
     type: system-architect

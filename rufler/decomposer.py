@@ -100,7 +100,7 @@ def decompose(
     """
     claude = _claude_bin()
     if not claude:
-        raise RuntimeError("`claude` binary not found on PATH — can't autogenerate tasks.")
+        raise RuntimeError("`claude` binary not found on PATH — can't decompose tasks.")
 
     prompt = build_prompt(main_task, count, prompt_template)
     cmd = [
