@@ -1006,7 +1006,3 @@ rufler/
 ## License
 
 MIT.
-
-## Credits
-
-Built on top of [`ruflo`](https://github.com/ruvnet/ruflo) by @ruvnet, and the Claude Code CLI by Anthropic.
