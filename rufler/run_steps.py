@@ -58,16 +58,58 @@ def resolve_exec_overrides(
     )
 
 
-def decompose_task_group(cfg: FlowConfig, console: Console) -> None:
+def decompose_task_group(
+    cfg: FlowConfig,
+    console: Console,
+    *,
+    force_new: bool = False,
+) -> None:
     """Decompose `task.main` into `task.decompose_count` subtasks via a
     claude-powered decomposer, then mutate `cfg.task.group` in place.
 
     No-op unless `cfg.task.multi` AND `cfg.task.decompose` AND the
     group is still empty. Exits the CLI on any failure — upstream already
     knows it's a fatal misconfiguration at this point.
+
+    When `force_new=False` (default) and the companion yml from a prior
+    decompose already exists on disk, the existing task files are reused
+    instead of calling claude again. Pass `force_new=True` (via
+    `rufler run --new`) to regenerate from scratch.
     """
     if not (cfg.task.multi and cfg.task.decompose and not cfg.task.group):
         return
+
+    from .config import TaskItem
+    import yaml as _yaml
+
+    yml_out = (cfg.base_dir / cfg.task.decompose_file).resolve()
+
+    if not force_new and yml_out.exists():
+        try:
+            raw = _yaml.safe_load(yml_out.read_text(encoding="utf-8")) or {}
+            group_raw = (raw.get("task") or {}).get("group") or []
+            items: list[TaskItem] = []
+            for g in group_raw:
+                if not isinstance(g, dict):
+                    continue
+                name = str(g.get("name") or "")
+                fp = g.get("file_path") or ""
+                resolved_fp = (yml_out.parent / fp).resolve()
+                if not name or not resolved_fp.exists():
+                    continue
+                items.append(TaskItem(name=name, file_path=str(resolved_fp)))
+            if items:
+                cfg.task.group = items
+                console.rule("[bold]0. decompose (reusing existing)[/bold]")
+                console.print(
+                    f"[dim]loaded {len(items)} subtask(s) from {yml_out}[/dim]"
+                )
+                console.print(
+                    f"[dim]use [bold]--new[/bold] to regenerate from scratch[/dim]"
+                )
+                return
+        except Exception:
+            pass
 
     try:
         main_body = cfg.task.resolved_main(cfg.base_dir)
@@ -81,7 +123,6 @@ def decompose_task_group(cfg: FlowConfig, console: Console) -> None:
         raise typer.Exit(1)
 
     out_dir = (cfg.base_dir / cfg.task.decompose_dir).resolve()
-    yml_out = (cfg.base_dir / cfg.task.decompose_file).resolve()
     console.rule(
         f"[bold]0. decompose main → {cfg.task.decompose_count} subtasks[/bold]"
     )
@@ -114,10 +155,6 @@ def decompose_task_group(cfg: FlowConfig, console: Console) -> None:
         console.print(f"[red]decomposer failed:[/red] {e}")
         raise typer.Exit(1)
 
-    # `w["file_path"]` is relative to the companion yml's directory; resolve
-    # to absolute so TaskItem.resolved() (which joins against cfg.base_dir)
-    # picks up the file regardless of where decompose_dir sits.
-    from .config import TaskItem
     cfg.task.group = [
         TaskItem(
             name=w["name"],

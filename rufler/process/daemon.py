@@ -138,12 +138,13 @@ def wait_for_log_end(
     console: Console,
     *,
     start_offset: int = 0,
-) -> bool:
+) -> tuple[bool, Optional[int]]:
     """Poll log_path for the logwriter's 'log ended' marker, only scanning
     bytes ADDED after `start_offset`. This avoids false positives from stale
     'log ended' lines left over from a previous run.
 
-    Returns True when the current run's end-marker is found, False on timeout.
+    Returns (found, rc): found=True when end-marker is detected, rc is the
+    exit code parsed from ``log ended rc=N`` (None if unparsable or timed out).
     """
     deadline = time.time() + timeout_sec
     last_size = start_offset
@@ -166,7 +167,14 @@ def wait_for_log_end(
                             continue
                         text = str(rec.get("text") or "")
                         if rec.get("src") == "rufler" and text.startswith("log ended"):
-                            return True
+                            rc: Optional[int] = None
+                            for part in text.split():
+                                if part.startswith("rc="):
+                                    try:
+                                        rc = int(part[3:])
+                                    except ValueError:
+                                        pass
+                            return True, rc
                     last_size = size
             except Exception as e:
                 if not warned:
@@ -176,4 +184,4 @@ def wait_for_log_end(
                     )
                     warned = True
         time.sleep(3)
-    return False
+    return False, None

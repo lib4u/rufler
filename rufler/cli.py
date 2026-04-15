@@ -32,6 +32,12 @@ from .process import (
     wait_for_log_end,
 )
 from .registry import Registry, RunEntry, TaskEntry, new_entry, _pid_alive
+from .task_markers import emit_task_marker, scan_task_boundaries
+from .tasks import (
+    resolve_tasks_for_entry, render_tasks_table, render_task_detail,
+    render_tokens_by_task, find_resumable_run, completed_task_names,
+)
+from .tokens import fmt_tokens
 from .run_steps import (
     decompose_task_group,
     finalize_run,
@@ -285,8 +291,21 @@ def run_cmd(
         "--log-file",
         help="Background log file. Overrides execution.log_file from yml.",
     ),
+    new: bool = typer.Option(
+        False, "--new",
+        help="Start all tasks from scratch: re-decompose and ignore previous progress.",
+    ),
+    from_task: Optional[int] = typer.Option(
+        None, "--from",
+        help="Resume from task slot N (1-based), skipping tasks before it.",
+    ),
 ):
-    """Validate config, init project, start daemons, launch autonomous swarm."""
+    """Validate config, init project, start daemons, launch autonomous swarm.
+
+    By default resumes from the last completed task of a previous run in the
+    same project directory. Use --new to start fresh, or --from N to start
+    from a specific task slot.
+    """
     global console
     if not skip_checks:
         if not print_checks(console):
@@ -312,7 +331,7 @@ def run_cmd(
         console.print("[red]No agents defined in rufler_flow.yml[/red]")
         raise typer.Exit(1)
 
-    decompose_task_group(cfg, console)
+    decompose_task_group(cfg, console, force_new=new)
 
     try:
         tasks = cfg.task.iter_tasks(cfg.base_dir)
@@ -423,11 +442,110 @@ def run_cmd(
             ).resolve()
         return (cfg.base_dir / eff.log_file).resolve()
 
+    # Classify the source of each task so `rufler tasks` can tell inline
+    # group items apart from AI-decomposed ones and plain mono `main`.
+    if not cfg.task.multi:
+        _source = "main"
+    elif cfg.task.decompose:
+        _source = "decomposed"
+    elif cfg.task.group:
+        _source = "group"
+    else:
+        _source = "inline"
+
+    # Map item-name → file_path (if the yml declared group items with files).
+    _file_paths: dict[str, str] = {}
+    try:
+        for item in cfg.task.group:
+            if getattr(item, "file_path", None):
+                _file_paths[item.name] = str(item.file_path)
+    except Exception:
+        pass
+
+    # Pre-populate TaskEntry records BEFORE the spawn loop so every task is
+    # visible to `rufler tasks` even while queued. Sub-id = `<run_id>.<slot2>`.
+    reg_entry.tasks = []
+    for i, (tname, _tbody) in enumerate(tasks, 1):
+        lp = _log_path_for(tname)
+        reg_entry.tasks.append(
+            TaskEntry(
+                name=tname,
+                log_path=str(lp),
+                pid=None,
+                id=f"{reg_entry.id}.{i:02d}",
+                slot=i,
+                source=_source,
+                file_path=_file_paths.get(tname),
+            )
+        )
+    registry.update(reg_entry)
+
+    # --- Resume logic: determine which tasks to skip ---
+    skip_slots: set[int] = set()
+    if from_task is not None:
+        # Explicit --from N: skip slots 1..N-1.
+        for te in reg_entry.tasks:
+            if te.slot < from_task:
+                skip_slots.add(te.slot)
+        if skip_slots:
+            console.print(
+                f"[cyan]--from {from_task}:[/cyan] skipping "
+                f"{len(skip_slots)} task(s) before slot {from_task}"
+            )
+    elif not new:
+        prev_entry = find_resumable_run(registry, cfg.base_dir, cfg_path)
+        if prev_entry and prev_entry.tasks:
+            done_map = completed_task_names(prev_entry)
+            if done_map:
+                if cfg.task.run_mode == "parallel" or not cfg.task.multi:
+                    for te in reg_entry.tasks:
+                        if te.name in done_map:
+                            skip_slots.add(te.slot)
+                else:
+                    for te in reg_entry.tasks:
+                        if te.name in done_map:
+                            skip_slots.add(te.slot)
+                        else:
+                            break
+                if skip_slots:
+                    # Copy timing metadata from previous run for skipped tasks.
+                    for te in reg_entry.tasks:
+                        if te.slot in skip_slots:
+                            prev_te = done_map.get(te.name)
+                            if prev_te:
+                                te.started_at = prev_te.started_at
+                                te.finished_at = prev_te.finished_at
+                                te.rc = 0
+                    registry.update(reg_entry)
+                    remaining = len(reg_entry.tasks) - len(skip_slots)
+                    first_active = next(
+                        (te.name for te in reg_entry.tasks if te.slot not in skip_slots),
+                        "?",
+                    )
+                    console.print(
+                        f"[cyan]resuming:[/cyan] skipping {len(skip_slots)} "
+                        f"completed task(s), starting from [bold]{first_active}[/bold] "
+                        f"({remaining} remaining)"
+                    )
+                    console.print(
+                        f"[dim]previous run: {prev_entry.id} — "
+                        f"use [bold]--new[/bold] to start from scratch[/dim]"
+                    )
+
+    def _task_by_slot(slot: int) -> TaskEntry:
+        return reg_entry.tasks[slot - 1]
+
     def _spawn_one(idx: int, tname: str, tbody: str) -> None:
+        te = _task_by_slot(idx)
         objective = cfg.build_objective(task_body=tbody, task_name=tname)
         task_id = f"{base_task_id}-{tname}"
         runner.hooks_pre_task(task_id=task_id, description=tbody[:500])
-        log_path = _log_path_for(tname)
+        log_path = Path(te.log_path)
+        te.started_at = time.time()
+        emit_task_marker(
+            log_path, "task_start",
+            task_id=te.id, slot=te.slot, name=te.name,
+        )
         if eff.background:
             pid = runner.hive_spawn_claude(
                 count=len(cfg.agents),
@@ -442,17 +560,14 @@ def run_cmd(
                 f"[green]▶ task[/green] [bold]{tname}[/bold] "
                 f"[dim]pid={pid} log={log_path}[/dim]"
             )
-            reg_entry.tasks.append(
-                TaskEntry(name=tname, log_path=str(log_path), pid=int(pid) if pid else None)
-            )
+            te.pid = int(pid) if pid else None
             if pid:
                 reg_entry.pids.append(int(pid))
             registry.update(reg_entry)
         else:
             console.rule(f"[bold]▶ {tname}[/bold]  [dim]log={log_path}[/dim]")
-            reg_entry.tasks.append(TaskEntry(name=tname, log_path=str(log_path), pid=None))
             registry.update(reg_entry)
-            runner.hive_spawn_claude(
+            spawn_rc = runner.hive_spawn_claude(
                 count=len(cfg.agents),
                 objective=objective,
                 role="specialist",
@@ -461,18 +576,31 @@ def run_cmd(
                 log_path=log_path,
                 detach=False,
             )
+            task_rc = int(spawn_rc) if spawn_rc else 0
+            te.finished_at = time.time()
+            te.rc = task_rc
+            emit_task_marker(
+                log_path, "task_end",
+                task_id=te.id, slot=te.slot, rc=task_rc,
+            )
+            registry.update(reg_entry)
 
     try:
         if cfg.task.run_mode == "parallel" or not cfg.task.multi:
-            # Parallel (or single mono task): fire everything, return.
             for i, (tname, tbody) in enumerate(tasks, 1):
+                if i in skip_slots:
+                    console.print(
+                        f"[dim]⏭ {tname}[/dim] [dim](completed in previous run)[/dim]"
+                    )
+                    continue
                 _spawn_one(i, tname, tbody)
         else:
-            # Sequential multi: run one at a time. In background mode we poll
-            # the per-task log for the logwriter's "log ended" marker, starting
-            # the scan from the file size captured BEFORE spawn so stale markers
-            # from previous runs don't trigger false positives.
             for i, (tname, tbody) in enumerate(tasks, 1):
+                if i in skip_slots:
+                    console.print(
+                        f"[dim]⏭ [{i}/{len(tasks)}] {tname} — skipped (completed)[/dim]"
+                    )
+                    continue
                 console.print(f"\n[bold cyan]━ [{i}/{len(tasks)}] {tname}[/bold cyan]")
                 pre_spawn_size = 0
                 if eff.background:
@@ -483,14 +611,23 @@ def run_cmd(
                         except OSError:
                             pre_spawn_size = 0
                 _spawn_one(i, tname, tbody)
-                if eff.background and i < len(tasks):
+                if eff.background:
+                    te = reg_entry.tasks[i - 1]
                     console.print(f"[dim]waiting for {tname} to finish...[/dim]")
-                    wait_for_log_end(
-                        _log_path_for(tname),
+                    found, log_rc = wait_for_log_end(
+                        Path(te.log_path),
                         cfg.task.timeout_minutes * 60,
                         console,
                         start_offset=pre_spawn_size,
                     )
+                    task_rc = log_rc if log_rc is not None else (0 if found else 1)
+                    te.finished_at = time.time()
+                    te.rc = task_rc
+                    emit_task_marker(
+                        Path(te.log_path), "task_end",
+                        task_id=te.id, slot=te.slot, rc=task_rc,
+                    )
+                    registry.update(reg_entry)
     except KeyboardInterrupt:
         # Docker-like: foreground run got Ctrl+C. Child claude -p procs share
         # our foreground process group so they've already received SIGINT from
@@ -663,7 +800,9 @@ def watch(
 @app.command()
 def logs(
     id_prefix: Optional[str] = typer.Argument(
-        None, metavar="[ID]", help="Run id from `rufler ps`. Omit to use current dir."
+        None, metavar="[ID]",
+        help="Run id or task sub-id (a1b2c3d4.01). "
+             "When a task sub-id is given, only that task's log slice is shown.",
     ),
     config: Path = typer.Option(
         Path(DEFAULT_FLOW_FILE), "--config", "-c", help="Path to rufler_flow.yml"
@@ -680,7 +819,60 @@ def logs(
     """Tail recent autopilot events, or the raw NDJSON run log with --raw.
 
     With `-f` / `--follow` the run log is streamed live (Ctrl+C to stop).
+
+    Pass a task sub-id (e.g. a1b2c3d4.01) to show only that task's log slice.
     """
+    # Task sub-id detection: if the id contains a dot, extract the task's
+    # byte range from the shared log and print only that slice.
+    if id_prefix and "." in id_prefix:
+        run_prefix = id_prefix.split(".")[0]
+        entry, cwd, yml_log = resolve_entry_or_cwd(
+            run_prefix, config, console, require_existing_dir=False,
+        )
+        if entry is None:
+            console.print(f"[red]no run matching[/red] [bold]{run_prefix}[/bold]")
+            raise typer.Exit(1)
+        te_match = None
+        for te in entry.tasks:
+            if te.id == id_prefix or te.id.startswith(id_prefix):
+                te_match = te
+                break
+        if te_match is None:
+            console.print(f"[red]task not found:[/red] [bold]{id_prefix}[/bold]")
+            raise typer.Exit(1)
+        lp = Path(te_match.log_path) if te_match.log_path else None
+        if not lp or not lp.exists():
+            console.print(f"[yellow]log not found:[/yellow] {lp}")
+            raise typer.Exit(1)
+        boundaries = scan_task_boundaries(lp)
+        tb = boundaries.get(te_match.id)
+        start_off = tb.start_offset if tb and tb.start_offset is not None else 0
+        end_off = tb.end_offset if tb and tb.end_offset is not None else None
+        console.rule(
+            f"[bold]task log[/bold] [cyan]{te_match.id}[/cyan] "
+            f"[dim]{te_match.name}[/dim]  [dim]{lp}[/dim]"
+        )
+        try:
+            with open(lp, "rb") as f:
+                if start_off:
+                    f.seek(start_off)
+                    f.readline()
+                while True:
+                    pos = f.tell()
+                    if end_off is not None and pos >= end_off:
+                        break
+                    raw_line = f.readline()
+                    if not raw_line:
+                        break
+                    console.print(
+                        raw_line.decode("utf-8", errors="replace").rstrip(),
+                        highlight=False, markup=False,
+                    )
+        except OSError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(1)
+        return
+
     entry, cwd, yml_log = resolve_entry_or_cwd(id_prefix, config, console)
     if follow or raw:
         lp = resolve_log_path(entry, None, cwd, yml_log)
@@ -740,6 +932,68 @@ def logs(
     r = Runner(cwd=cwd)
     console.rule(f"[bold]autopilot log[/bold] [dim](last {last})[/dim]")
     r.autopilot_log(last=last)
+
+
+@app.command("follow")
+def follow_cmd(
+    id_prefix: Optional[str] = typer.Argument(
+        None, metavar="[ID]", help="Run id from `rufler ps`. Omit to use current dir."
+    ),
+    config: Path = typer.Option(
+        Path(DEFAULT_FLOW_FILE), "--config", "-c", help="Path to rufler_flow.yml"
+    ),
+):
+    """Live TUI dashboard with task progress, AI conversation, and system log.
+
+    Tails all per-task NDJSON logs and renders a dashboard with four panels:
+    tasks list, session stats, AI conversation stream, and system events.
+    Replays existing log content for context, then streams live. Ctrl+C to stop.
+    """
+    entry, cwd, yml_log = resolve_entry_or_cwd(id_prefix, config, console)
+
+    # Without an explicit id, resolve_entry_or_cwd returns entry=None.
+    # Auto-pick the most recent run for this cwd (running preferred, then
+    # latest finished) so `rufler follow` works without arguments.
+    if entry is None and not id_prefix:
+        cwd_resolved = cwd.resolve()
+        all_entries = Registry().list_refreshed(include_all=True)
+        candidates = [
+            e for e in all_entries
+            if Path(e.base_dir).resolve() == cwd_resolved
+        ]
+        if candidates:
+            running = [e for e in candidates if e.status == "running"]
+            entry = running[0] if running else candidates[0]
+
+    lp = resolve_log_path(entry, None, cwd, yml_log)
+
+    task_logs: list[tuple[str, Path]] | None = None
+    task_defs = None
+    if entry and entry.tasks:
+        task_logs = [
+            (te.name, Path(te.log_path))
+            for te in entry.tasks
+            if te.log_path
+        ]
+        from .follow import TaskSeed
+        task_defs = [
+            TaskSeed(
+                task_id=te.id,
+                name=te.name,
+                started_at=te.started_at,
+                finished_at=te.finished_at,
+                rc=te.rc,
+            )
+            for te in entry.tasks
+        ]
+
+    n_logs = len(task_logs) if task_logs else 1
+    run_label = f"  [cyan]{entry.id}[/cyan]" if entry else ""
+    console.print(
+        f"[dim]following{run_label}  {n_logs} log(s) — Ctrl+C to stop[/dim]"
+    )
+    from .follow import follow as _follow_tui
+    _follow_tui(lp, task_logs=task_logs, task_defs=task_defs)
 
 
 @app.command()
@@ -1041,6 +1295,168 @@ def rm(
         console.print(f"[dim]{removed_count} entries removed[/dim]")
 
 
+@app.command("ps")
+def ps_cmd(
+    id_prefix: Optional[str] = typer.Argument(
+        None,
+        metavar="[ID]",
+        help="Run id prefix for a detailed single-run view. Omit for the list.",
+    ),
+    all_runs: bool = typer.Option(
+        False, "--all", "-a", help="Show all runs, not just currently running"
+    ),
+    prune: bool = typer.Option(
+        False, "--prune",
+        help="Drop entries whose base_dir no longer exists on disk",
+    ),
+    prune_older_than_days: Optional[int] = typer.Option(
+        None, "--prune-older-than-days",
+        help="Drop finished entries older than N days",
+    ),
+):
+    """Docker-style list of rufler runs.
+
+    \b
+    No args → currently running only (like `docker ps`).
+    -a     → everything ever run (like `docker ps -a`).
+    <ID>   → detailed view of one run: status, tasks, pids, log tail.
+    --prune / --prune-older-than-days → clean up stale entries.
+    """
+    reg = Registry()
+
+    if prune:
+        removed = reg.prune(missing_dirs=True)
+        console.print(f"[dim]pruned {removed} entries with missing base_dir[/dim]")
+        return
+    if prune_older_than_days is not None:
+        removed = reg.prune(missing_dirs=False, older_than_sec=prune_older_than_days * 86400)
+        console.print(f"[dim]pruned {removed} entries older than {prune_older_than_days}d[/dim]")
+        return
+
+    if id_prefix:
+        entry, _, _ = resolve_entry_or_cwd(
+            id_prefix, Path(DEFAULT_FLOW_FILE), console,
+            require_existing_dir=False,
+        )
+        if entry is None:
+            console.print(f"[red]no run matching[/red] [bold]{id_prefix}[/bold]")
+            raise typer.Exit(1)
+        _ps_detail(entry, console)
+        return
+
+    entries = reg.list_refreshed(include_all=all_runs)
+    if not entries:
+        if all_runs:
+            console.print("[yellow]no runs recorded[/yellow]")
+        else:
+            console.print(
+                "[yellow]no running rufler runs[/yellow]  "
+                "[dim](use -a to see all)[/dim]"
+            )
+        return
+
+    table = Table(
+        title=f"rufler ps {'(all)' if all_runs else '(running)'}",
+        show_lines=False,
+    )
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("PROJECT", style="bold")
+    table.add_column("MODE", style="dim")
+    table.add_column("STATUS")
+    table.add_column("TASKS", justify="right")
+    table.add_column("CREATED", style="dim")
+    table.add_column("TOKENS", justify="right", style="magenta")
+    table.add_column("BASE DIR", overflow="fold", style="dim")
+
+    for e in entries:
+        color = STATUS_COLORS.get(e.status, "white")
+        if e.status == "failed" and e.exit_code is not None:
+            status_cell = f"[{color}]{e.status} ({e.exit_code})[/{color}]"
+        else:
+            status_cell = f"[{color}]{e.status}[/{color}]"
+
+        created = fmt_age(e.started_at)
+        tok = fmt_tokens(e.total_tokens) if e.total_tokens else "-"
+        task_count = str(len(e.tasks)) if e.tasks else "-"
+        base = e.base_dir
+        if not Path(base).exists():
+            base = f"[dim strike]{base}[/dim strike]"
+
+        table.add_row(
+            e.id, e.project, e.mode, status_cell,
+            task_count, created, tok, base,
+        )
+
+    console.print(table)
+    console.print(
+        f"[dim]{len(entries)} run(s)"
+        + ("" if all_runs else " — use [bold]-a[/bold] for all")
+        + "[/dim]"
+    )
+
+
+def _ps_detail(entry: RunEntry, console: Console) -> None:
+    """Detailed single-run view for `rufler ps <id>`."""
+    color = STATUS_COLORS.get(entry.status, "white")
+    console.rule(
+        f"[bold]run[/bold] [cyan]{entry.id}[/cyan]  "
+        f"[{color}]{entry.status}[/{color}]"
+    )
+    console.print(f"  project     : [bold]{entry.project}[/bold]")
+    console.print(f"  flow_file   : {entry.flow_file}")
+    console.print(f"  base_dir    : {entry.base_dir}")
+    console.print(f"  mode        : {entry.mode}  run_mode={entry.run_mode}")
+    console.print(f"  log_path    : {entry.log_path}")
+    console.print(f"  started_at  : {fmt_age(entry.started_at)}")
+    if entry.finished_at:
+        console.print(f"  finished_at : {fmt_age(entry.finished_at)}")
+    if entry.exit_code is not None:
+        rc_style = "green" if entry.exit_code == 0 else "red"
+        console.print(f"  exit_code   : [{rc_style}]{entry.exit_code}[/{rc_style}]")
+
+    if entry.pids:
+        alive_pids = [p for p in entry.pids if _pid_alive(p)]
+        dead_pids = [p for p in entry.pids if not _pid_alive(p)]
+        parts = []
+        if alive_pids:
+            parts.append(f"[green]{','.join(str(p) for p in alive_pids)}[/green]")
+        if dead_pids:
+            parts.append(f"[dim]{','.join(str(p) for p in dead_pids)}[/dim]")
+        console.print(f"  pids        : {' '.join(parts)}")
+
+    console.print()
+    console.print(f"  tokens      : [magenta]{entry.total_tokens:,}[/magenta]  "
+                   f"[dim](in={entry.input_tokens:,} out={entry.output_tokens:,} "
+                   f"cache_r={entry.cache_read:,} cache_c={entry.cache_creation:,})[/dim]")
+
+    if entry.tasks:
+        console.print()
+        console.rule("[dim]tasks[/dim]")
+        resolved = resolve_tasks_for_entry(entry)
+        from .tasks import TASK_STATUS_COLORS
+        for te, st, tok in resolved:
+            tc = TASK_STATUS_COLORS.get(st, "white")
+            tok_str = f"  [{fmt_tokens(tok)}]" if tok else ""
+            console.print(
+                f"  [cyan]{te.id}[/cyan]  {te.name:<20s}  "
+                f"[{tc}]{st:<8s}[/{tc}]{tok_str}"
+            )
+
+    try:
+        procs = find_claude_procs(Path(entry.base_dir))
+        if procs:
+            console.print()
+            console.rule("[dim]claude processes[/dim]")
+            for p in procs:
+                console.print(
+                    f"  pid={p.get('pid','?')}  "
+                    f"elapsed={p.get('elapsed','?')}  "
+                    f"[dim]{(p.get('cmd') or '')[:80]}[/dim]"
+                )
+    except Exception:
+        pass
+
+
 @app.command("projects")
 def projects_cmd():
     """List all projects ever run by rufler with last-run timestamps.
@@ -1054,8 +1470,6 @@ def projects_cmd():
         console.print("[yellow]no projects recorded[/yellow]")
         return
 
-    from rich.table import Table
-    from .tokens import fmt_tokens
     table = Table(title=f"rufler projects ({len(projs)})", show_lines=False)
     table.add_column("PROJECT", style="cyan", no_wrap=True)
     table.add_column("LAST RUN", style="bold")
@@ -1094,6 +1508,118 @@ def projects_cmd():
     )
 
 
+@app.command("tasks")
+def tasks_cmd(
+    id_or_task: Optional[str] = typer.Argument(
+        None,
+        metavar="[ID]",
+        help="Run id or task sub-id (e.g. a1b2c3d4 or a1b2c3d4.01). "
+             "Omit to show tasks of the latest run in cwd.",
+    ),
+    config: Path = typer.Option(
+        Path(DEFAULT_FLOW_FILE), "--config", "-c", help="Path to rufler_flow.yml"
+    ),
+    all_runs: bool = typer.Option(
+        False, "--all", "-a", help="Show tasks across ALL runs, not just the latest"
+    ),
+    status_filter: Optional[str] = typer.Option(
+        None, "--status", "-s",
+        help="Filter by status: queued, running, exited, failed, stopped, skipped"
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Show detailed card for a single task"
+    ),
+):
+    """List tasks for a rufler run with status, tokens, and timing.
+
+    \b
+    By default shows the latest run's tasks for the current directory.
+    Pass a run id prefix to inspect a specific run, or a full task sub-id
+    (e.g. a1b2c3d4.01) plus -v for a detailed card.
+    """
+    reg = Registry()
+
+    target_task_id: Optional[str] = None
+    run_id_prefix: Optional[str] = None
+    if id_or_task and "." in id_or_task:
+        target_task_id = id_or_task
+        run_id_prefix = id_or_task.split(".")[0]
+        verbose = True
+    elif id_or_task:
+        run_id_prefix = id_or_task
+
+    if all_runs:
+        entries = reg.list_refreshed(include_all=True)
+        if not entries:
+            console.print("[yellow]no runs recorded[/yellow]")
+            raise typer.Exit(0)
+    elif run_id_prefix:
+        entry, _, _ = resolve_entry_or_cwd(
+            run_id_prefix, config, console, require_existing_dir=False
+        )
+        if entry is None:
+            console.print(f"[red]no run matching[/red] [bold]{run_id_prefix}[/bold]")
+            raise typer.Exit(1)
+        entries = [entry]
+    else:
+        cwd_resolved = Path.cwd().resolve()
+        all_entries = reg.list_refreshed(include_all=True)
+        candidates = [
+            e for e in all_entries
+            if Path(e.base_dir).resolve() == cwd_resolved
+        ]
+        if not candidates:
+            console.print(
+                "[yellow]no rufler runs found for this directory[/yellow]\n"
+                "[dim]run [bold]rufler run[/bold] first, or pass a run id: "
+                "[bold]rufler tasks <id>[/bold][/dim]"
+            )
+            raise typer.Exit(0)
+        entries = [candidates[0]]
+
+    # Detail view for a single task.
+    if target_task_id and verbose:
+        for entry in entries:
+            resolved = resolve_tasks_for_entry(entry)
+            for te, st, tok in resolved:
+                if te.id == target_task_id or te.id.startswith(target_task_id):
+                    render_task_detail(entry, te, st, tok, console)
+                    return
+        console.print(f"[red]task not found:[/red] [bold]{target_task_id}[/bold]")
+        raise typer.Exit(1)
+
+    # Table view.
+    all_rows: list[tuple[RunEntry, TaskEntry, str, int]] = []
+    for entry in entries:
+        resolved = resolve_tasks_for_entry(entry)
+        for te, st, tok in resolved:
+            if status_filter and st != status_filter:
+                continue
+            all_rows.append((entry, te, st, tok))
+
+    if not all_rows:
+        if status_filter:
+            console.print(
+                f"[yellow]no tasks with status '{status_filter}'[/yellow]"
+            )
+        else:
+            console.print("[yellow]no tasks found[/yellow]")
+        raise typer.Exit(0)
+
+    title = "rufler tasks"
+    if len(entries) == 1:
+        e = entries[0]
+        title += f"  [dim]{e.project}[/dim]  [cyan]{e.id}[/cyan]"
+        title += f"  [dim]({e.status})[/dim]"
+
+    render_tasks_table(
+        all_rows,
+        console=console,
+        title=title,
+        show_run_column=all_runs,
+    )
+
+
 @app.command("tokens")
 def tokens_cmd(
     id_prefix: Optional[str] = typer.Argument(
@@ -1104,6 +1630,9 @@ def tokens_cmd(
     rescan: bool = typer.Option(
         False, "--rescan", help="Re-parse run logs before reporting (slower but accurate)."
     ),
+    by_task: bool = typer.Option(
+        False, "--by-task", help="Show per-task token breakdown instead of run/project totals."
+    ),
 ):
     """Show token usage — per run, per project, and grand total across all projects.
 
@@ -1111,9 +1640,36 @@ def tokens_cmd(
     per-project rollup, so this command is cheap and works even after the
     underlying log files have been deleted (use --rescan if you want to
     refresh from disk).
+
+    Use --by-task to show per-task token breakdown for a specific run.
     """
-    from .tokens import fmt_tokens
     reg = Registry()
+
+    if by_task:
+        entry: Optional[RunEntry] = None
+        if id_prefix:
+            entry, _, _ = resolve_entry_or_cwd(
+                id_prefix, Path(DEFAULT_FLOW_FILE), console,
+                require_existing_dir=False,
+            )
+        else:
+            cwd_resolved = Path.cwd().resolve()
+            all_entries = reg.list_refreshed(include_all=True)
+            candidates = [
+                e for e in all_entries
+                if Path(e.base_dir).resolve() == cwd_resolved
+            ]
+            if candidates:
+                entry = candidates[0]
+        if entry is None:
+            console.print("[red]no run found[/red] — pass a run id or run from a project dir")
+            raise typer.Exit(1)
+        resolved = resolve_tasks_for_entry(entry)
+        if not resolved:
+            console.print(f"[yellow]no tasks in run[/yellow] [cyan]{entry.id}[/cyan]")
+            raise typer.Exit(0)
+        render_tokens_by_task(entry, resolved, console)
+        return
 
     if id_prefix:
         entry, _, _ = resolve_entry_or_cwd(id_prefix, Path(DEFAULT_FLOW_FILE), console, require_existing_dir=False)

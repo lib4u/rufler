@@ -49,11 +49,13 @@ In short: `ruflo` is the engine, `rufler` is the ignition + dashboard + cruise c
 - **Token usage tracking** — `rufler tokens` reports input/output/cache tokens per run, per project, and grand total across all projects. Per-project totals are cumulative and survive `rufler rm`.
 - **Agent inspection** — `rufler agents` lists every agent in the flow with type, role, seniority, depends_on and a 150-char prompt preview (`--full` for the full body).
 - **Soft agent DAG** — declare `depends_on: [architect]` on an agent and rufler injects GATE/HANDOFF blocks into the objective so downstream agents poll shared memory for an upstream brief and approval before starting work. Cycles, self-deps and unknown names are rejected at load time.
+- **Task tracking** — every task gets a sub-id (`a1b2c3d4.01`), persistent status (queued / running / exited / failed / stopped / skipped), per-task token accounting, and timing. `rufler tasks` shows it all; `rufler tasks <sub-id> -v` prints a detailed card.
+- **Resume on restart** — `rufler run` automatically detects the previous run for the same project, skips already-completed tasks, and reuses decomposed task files. No wasted claude calls. `--new` forces a clean start, `--from N` resumes from a specific task slot.
 - **Soft resume via memory** — the composed objective tells agents to probe the shared memory namespace for prior progress before restarting work, so an interrupted run can pick up where it left off.
 - **Mono, multi and decomposed tasks** — run one big task, an explicit list of subtasks, or let Claude decompose `main` into N subtasks.
 - **Sequential and parallel run modes** for multi-task groups.
 - **Detached background mode** with a proper supervisor process and NDJSON logs.
-- **Live dashboard** via `rufler follow` (tokens, tools, events, session state).
+- **Live dashboard** via `rufler follow` — 4-panel TUI with task list, session stats, AI conversation stream (thinking, text, tool calls), and system events. Tails all per-task logs in multi-task mode.
 - **Custom decomposer prompt** — override the task-splitter prompt inline or from an `.md` file.
 - **Typed dataclass config** — schema validation, role/seniority checks, unknown-key tolerance.
 - **External prompts** — agents and tasks can be inline OR loaded from `.md` files, so prompts stay out of YAML.
@@ -129,19 +131,20 @@ rufler stop
 | `rufler check` | Verify that `node`, `claude` and `ruflo` are available and report how each was resolved. |
 | `rufler init` | Create a sample `rufler_flow.yml` in the current directory. |
 | `rufler agents [ID]` | List agents declared in the flow (name, type, role, seniority, depends_on, 150-char prompt preview). With an id → reads the flow file from that run's registry entry. `--full` prints full prompt bodies. |
-| `rufler run [FLOW_FILE]` | Validate config, run ruflo init/daemon/memory/swarm/hive-mind, spawn the Claude swarm. Foreground by default; Ctrl+C kills. Add `-d` to detach. |
+| `rufler run [FLOW_FILE]` | Validate config, run ruflo init/daemon/memory/swarm/hive-mind, spawn the Claude swarm. Foreground by default; Ctrl+C kills. Add `-d` to detach. Resumes from last completed task by default; `--new` to start fresh, `--from N` to resume from slot N. |
 | `rufler build [FLOW_FILE]` | Same preparation pipeline as `rufler run` (checks → ruflo init → daemon → memory → swarm → hive-mind → skills install) **without** launching Claude. Useful to apply yml changes (skills, memory, swarm) to an existing project. `--skip-init` skips the ruflo init + daemon step for quick re-builds. |
 | `rufler skills` | Inspect installed skills in `<project>/.claude/skills/` and show the yml snapshot. `--available` lists packs/skills in ruflo's bundled source tree. `--delete` wipes non-symlinked skill dirs from the project (with confirmation; `-y` to skip). |
 | `rufler ps [ID]` | Docker-style list of runs. No args → running only. `-a` → all. `--prune` / `--prune-older-than-days N` → clean stale entries. With an ID → detailed view of one run (status, tasks, claude procs, log tail). |
+| `rufler tasks [ID]` | List tasks for a run with sub-ids, status, tokens, timing. Without id → latest run in cwd. `-a` → all runs. `--status running` → filter. Pass a task sub-id (e.g. `a1b2c3d4.01 -v`) for a detailed card with token breakdown and recent log events. |
 | `rufler projects` | Per-project rollup: last run id, when it last ran, total runs. Survives `rufler rm` and pruning. |
-| `rufler logs [ID]` | Tail recent autopilot events. `--raw` prints the NDJSON log directly. `-f` / `--follow` streams new lines live, like `docker logs -f`. |
-| `rufler follow [ID]` | `tail -f` with a dashboard: session, tasks, tokens, last tool, recent events. |
+| `rufler logs [ID]` | Tail recent autopilot events. `--raw` prints the NDJSON log directly. `-f` / `--follow` streams new lines live. Pass a task sub-id (e.g. `a1b2c3d4.01`) to see only that task's log slice. |
+| `rufler follow [ID]` | Live TUI dashboard: task progress (with status icons), AI conversation stream (thinking, text, tool calls), session stats, and system events. Tails all per-task logs automatically. |
 | `rufler status [ID]` | System + swarm + hive-mind + autopilot status in one call. |
 | `rufler watch [ID]` | Poll `rufler status` on a loop until Ctrl-C. |
 | `rufler progress [ID]` | Autopilot task progress + recent iteration log. |
 | `rufler stop [ID]` | Shutdown autopilot, hive-mind and daemon; record post-task hook; end session. `--kill` sends SIGTERM to the supervisor pids. |
 | `rufler rm [ID]...` | Remove registry entries. `--all-finished` / `--older-than-days N` for bulk cleanup. Refuses running entries. |
-| `rufler tokens [ID]` | Token usage report — without id: per-project table + grand total across all projects. With an id: detailed breakdown of one run. `--rescan` re-parses run logs from disk. |
+| `rufler tokens [ID]` | Token usage report — without id: per-project table + grand total. With an id: detailed breakdown. `--by-task` shows per-task token breakdown. `--rescan` re-parses run logs from disk. |
 
 Every run-scoped command (`logs`, `follow`, `status`, `watch`, `progress`, `stop`) accepts an optional run id prefix as a positional argument. Without an id it resolves to the run started from the current working directory.
 
@@ -164,9 +167,14 @@ Options:
   -d, --background/--foreground
                                Detach from terminal (implies --non-interactive --yolo).
   --log-file PATH              Override execution.log_file from yml.
+  --new                        Start all tasks from scratch: re-decompose and ignore
+                               previous progress.
+  --from N                     Resume from task slot N (1-based), skipping tasks before it.
 ```
 
 CLI flags always override the `execution:` section of `rufler_flow.yml`.
+
+By default `rufler run` **resumes** from where a previous run stopped. It reuses existing decomposed task files (skipping the claude call) and skips tasks that already completed successfully (`rc=0`). Use `--new` to force a clean start.
 
 ---
 
@@ -335,6 +343,24 @@ On `rufler run`, rufler calls `claude -p` with the decomposer prompt, parses the
 
 You can override the decomposer prompt inline (`decompose_prompt`) or from a file (`decompose_prompt_path`). Templates may reference `{n}` (count) and `{main}` (main task) as placeholders — literal `{` / `}` in the template are safe.
 
+### When to use which mode
+
+| Situation | Recommended mode | Why |
+|---|---|---|
+| You already wrote the N subtasks as `.md` files and the order / scope matters for review | **mono → single task** OR **explicit `group`** | Reproducible, diffable in PRs, no LLM randomness. You control everything. |
+| One focused goal, no real decomposition needed | **mono** (`multi: false`, `main` or `main_path`) | Lowest overhead — one hive, one log, one objective. |
+| Hand-written skeleton with clear hand-off between stages (schema → api → tests → ci) | **`group`** + `run_mode: sequential` | Subsequent subtasks read prior agents' output from shared memory; order is load-bearing. |
+| Independent subtasks that can race (`service_a`, `service_b`, `docs`) | **`group`** + `run_mode: parallel` + `rufler run -d` | Each subtask gets its own supervisor and NDJSON log; you only need `-d` because parallel needs detached supervisors. |
+| Big fuzzy goal, you want Claude to propose a split before executing | **`decompose: true`** | rufler calls `claude -p` with the decomposer prompt, writes `.tasks/task_{1..N}.md` + a companion yml, then runs them as a group. |
+| `decompose: true` but you want to pin the split style (always "schema → api → tests → ci") | **`decompose_prompt`** (inline) or **`decompose_prompt_path`** (md file) with `{n}` / `{main}` placeholders | The default prompt is generic; a custom template makes decomposition deterministic across runs of the same project. |
+| You want to **review** the generated split before running the swarm | `decompose: true` + `rufler run --dry-run` | Decomposition runs, files are written, plan banner is printed, then rufler stops before spawning. Inspect `.tasks/*.md`, then re-run without `--dry-run`. |
+| Subtasks are independent enough for parallel but you don't want to hand-write them | `decompose: true` + `run_mode: parallel` + `rufler run -d` | Works fine — decomposer writes the group, supervisor spawns them in parallel. |
+| A previous run crashed halfway through a group | **`group`** (or already-decomposed `.tasks/decomposed_tasks.yml`) + re-run | Rufler's composed objective tells agents to probe shared memory for prior progress, so the swarm picks up where it left off instead of restarting from zero. |
+| You need a soft DAG between agents inside each subtask (architect → coder → tester) | Either mode + `depends_on:` on the agents | Orthogonal to `group` vs `decompose` — `depends_on` injects GATE/HANDOFF clauses into the objective regardless of how the subtask came to be. |
+| CI or one-shot experiment where reproducibility matters more than convenience | **`group`** with committed `.md` files | Avoid `decompose` — every run would re-ask the LLM and risk a different split. |
+
+Rule of thumb: **write `group` when the split is part of your spec; use `decompose` when the split itself is the question you're asking Claude.**
+
 ---
 
 ## Runs, projects and statuses
@@ -395,9 +421,101 @@ rufler rm --older-than-days 30 # bulk prune
 
 `rm` refuses to delete runs that are currently `running` — use `rufler stop <id>` first.
 
+### `rufler tasks` — task tracking
+
+```bash
+rufler tasks                       # tasks of the latest run in cwd
+rufler tasks a1b2                  # tasks of a specific run
+rufler tasks -a                    # all tasks across all runs
+rufler tasks --status running      # filter by status
+rufler tasks a1b2c3d4.01 -v       # detailed card for one task
+```
+
+Table columns: `TASK ID | SLOT | NAME | STATUS | SOURCE | STARTED | DURATION | TOKENS | LOG`.
+
+Every task gets a **sub-id** in the format `<run_id>.<slot>` (e.g. `a1b2c3d4.01`). Status is derived lazily from log markers + pid liveness + registry data — never cached.
+
+| Task status | Meaning |
+|-------------|---------|
+| `queued` | Run is still alive, task hasn't started yet |
+| `running` | `task_start` marker found, no `task_end`, pid alive |
+| `exited` | `task_end` with `rc=0` |
+| `failed` | `task_end` with `rc != 0` |
+| `stopped` | Run stopped before task finished |
+| `skipped` | Run finished but task never started |
+
+The **detail view** (`-v`) shows full metadata, per-task token breakdown (input / output / cache_read / cache_creation), and the last 10 log events for that task.
+
+### `rufler tokens --by-task` — per-task token breakdown
+
+```bash
+rufler tokens --by-task              # per-task tokens for the latest run
+rufler tokens --by-task a1b2c3d4     # per-task tokens for a specific run
+```
+
+### Task resume on restart
+
+When you stop a run mid-way and restart:
+
+```bash
+rufler run -d            # starts 4 tasks, task_1 and task_2 complete
+# Ctrl+C / rufler stop
+rufler run -d            # auto-resumes from task_3
+# => resuming: skipping 2 completed tasks, starting from task_3
+```
+
+Resume works at two levels:
+
+1. **Decomposed task files** — if `.rufler/tasks/decomposed_tasks.yml` already exists, rufler loads tasks from it instead of calling claude again. No wasted tokens on re-decomposition.
+2. **Completed tasks** — rufler finds the previous run for this project/directory in the registry, checks which tasks finished with `rc=0`, and skips them. Comparison is by task **name** (not slot), so adding/removing tasks in the yml correctly triggers re-execution.
+
+Flags:
+- `rufler run` — resume by default
+- `rufler run --new` — ignore previous progress, re-decompose, start all tasks from scratch
+- `rufler run --from 3` — skip tasks 1-2 explicitly, start from slot 3
+
+### `rufler follow` — live TUI dashboard
+
+```bash
+rufler follow              # auto-picks the running (or latest) run in cwd
+rufler follow a1b2         # follow a specific run by id
+```
+
+Four-panel dashboard:
+
+```
+╭─ rufler follow ─────────────────────── [running] ── 00:04:23 ─╮
+│ model: claude-opus-4-6    swarm: hive-17762684    workers: 4   │
+╰───────────────────────────────────────────────────────────────╯
+╭─ Tasks  2/4 ────────────╮╭─ Session ─────────────────────────╮
+│ ✓ task_1     done  1m12s││ model   claude-opus-4-6           │
+│ ▶ task_2     running 52s││ tokens  in=98 out=829             │
+│   task_3     queued     ││ turns   14                        │
+│   task_4     queued     ││ last    Write                     │
+╰─────────────────────────╯╰───────────────────────────────────╯
+╭─ Conversation (task_2) ──────────────────────────────────────╮
+│ 14:23  think  Planning the API routes — need UserList...     │
+│ 14:23  text   I'll create the handler files with types...    │
+│ 14:24  tool   Write(src/api/routes.go)                       │
+│ 14:24  result File created successfully                      │
+╰──────────────────────────────────────────────────────────────╯
+╭─ Log ────────────────────────────────────────────────────────╮
+│ 14:22  OK    task_end task_1 done                            │
+│ 14:22  INFO  task_start task_2                               │
+│ 14:23  INFO  session init (claude-opus-4-6)                  │
+╰──────────────────────────────────────────────────────────────╯
+```
+
+- **Tasks** — task list with status icons (✓ ▶ ○ ✗), duration, per-task tokens
+- **Session** — model, token totals, turns, last tool
+- **Conversation** — AI stream for the active task: thinking (3-5 lines), text (full), tool calls with params, tool results
+- **Log** — system events: task markers, hooks, errors, rate limits
+
+In multi-task mode, follow tails **all per-task log files** simultaneously (not just the primary `run.log`).
+
 ### Soft resume via shared memory (periodic checkpointing)
 
-rufler does not checkpoint progress in the registry — "resume at step N" is not a thing. Instead, every composed objective ends with two auto-injected sections that force agents to continuously persist state to AgentDB:
+In addition to the task-level resume above, every composed objective ends with two auto-injected sections that force agents to continuously persist state to AgentDB:
 
 **`# RESUME AWARENESS`** — tells agents, before they start, to search the shared memory namespace (from `memory.namespace`) for prior progress using standard keys (`checkpoint:latest`, `progress`, `decisions`, `blockers`, `completed`, `last_step`). If they find state from a prior interrupted run, they continue from there instead of redoing work.
 
@@ -723,16 +841,13 @@ With an id you get the breakdown for that single run, with raw counts. `rufler p
 
 ### How counts are derived
 
-The parser walks the run log (`.rufler/run.log` by default) line by line, looking for records of the form:
+The parser walks NDJSON log files, looking for `src=claude, type=assistant` records. Claude stream-json emits **multiple `assistant` events per turn** (one per content block), all sharing the same `message.id`. The parser deduplicates by `message.id`, keeping only the last event per turn.
 
-```json
-{"src": "claude", "type": "assistant", "message": {"usage": {
-  "input_tokens": 12, "output_tokens": 5,
-  "cache_read_input_tokens": 800, "cache_creation_input_tokens": 50
-}}}
-```
+Token semantics:
+- `input_tokens` / `output_tokens` — **per-turn deltas** → summed across turns
+- `cache_read_input_tokens` / `cache_creation_input_tokens` — **session-cumulative** → max taken
 
-Multi-task runs aggregate per-task log files automatically (with deduplication if a task points at the same log). Missing logs are tolerated — they contribute 0.
+Multi-task runs scan per-task log files automatically (with deduplication if a task points at the same log). `rufler tasks` uses byte-range slicing (`task_start.offset` → `task_end.offset`) to attribute tokens to individual tasks within a shared sequential log. Missing logs contribute 0.
 
 ---
 
@@ -842,15 +957,25 @@ Project layout:
 ```
 rufler/
 ├── rufler/
-│   ├── cli.py           # Typer app: run / ps / projects / logs / follow / stop / rm
+│   ├── cli.py           # Typer app: run / ps / tasks / logs / follow / stop / rm / tokens
 │   ├── config.py        # dataclass schema + YAML loader + objective composer
-│   ├── registry.py      # ~/.rufler/registry.json with fcntl lock, runs + projects
+│   ├── registry.py      # ~/.rufler/registry.json — RunEntry + TaskEntry with fcntl lock
 │   ├── runner.py        # thin wrapper around ruflo subcommands
 │   ├── checks.py        # node/claude/ruflo resolution
 │   ├── decomposer.py    # AI task decomposition via claude -p
 │   ├── logwriter.py     # NDJSON supervisor (foreground tee + detached)
-│   ├── follow.py        # live dashboard for the NDJSON log
-│   └── templates.py     # `rufler init` sample
+│   ├── follow.py        # live 4-panel TUI dashboard (multi-log tailing)
+│   ├── task_markers.py  # task_start/task_end NDJSON markers + boundary scanner
+│   ├── tokens.py        # per-turn token parser with message.id dedup
+│   ├── run_steps.py     # decompose / plan / finalize helpers
+│   ├── templates.py     # `rufler init` sample
+│   ├── tasks/           # task tracking subpackage
+│   │   ├── resolve.py   # status derivation, resume logic, per-task tokens
+│   │   └── display.py   # Rich tables, detail cards, log tail rendering
+│   ├── skills/          # skill install/display subpackage
+│   └── process/         # daemonization, pid management, log paths
+├── tests/
+│   └── test_basics.py   # 71 tests (registry, tokens, tasks, resume, CLI)
 └── examples/            # ready-to-run rufler_flow.yml files
 ```
 

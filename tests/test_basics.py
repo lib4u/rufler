@@ -225,13 +225,12 @@ def test_remove_many_empty():
 
 def _write_log(path: Path, assistant_usages: list[dict]):
     lines = []
-    for u in assistant_usages:
+    for i, u in enumerate(assistant_usages):
         lines.append(json.dumps({
             "src": "claude",
             "type": "assistant",
-            "message": {"usage": u},
+            "message": {"id": f"msg_{i}", "usage": u},
         }))
-    # Also throw in some noise the parser must ignore.
     lines.append(json.dumps({"src": "rufler", "text": "log started"}))
     lines.append("not json")
     lines.append("")
@@ -241,17 +240,19 @@ def _write_log(path: Path, assistant_usages: list[dict]):
 def test_parse_log_sums_assistant_usage(tmp_path: Path):
     from rufler.tokens import parse_log
     log = tmp_path / "x.log"
+    # input/output are per-turn deltas (summed),
+    # cache fields are session-cumulative (max wins).
     _write_log(log, [
         {"input_tokens": 10, "output_tokens": 5,
          "cache_read_input_tokens": 100, "cache_creation_input_tokens": 7},
         {"input_tokens": 3, "output_tokens": 2,
-         "cache_read_input_tokens": 50, "cache_creation_input_tokens": 0},
+         "cache_read_input_tokens": 150, "cache_creation_input_tokens": 7},
     ])
     u = parse_log(log)
     assert u.input_tokens == 13
     assert u.output_tokens == 7
-    assert u.cache_read == 150
-    assert u.cache_creation == 7
+    assert u.cache_read == 150   # max(100, 150)
+    assert u.cache_creation == 7  # max(7, 7)
     assert u.total == 13 + 7 + 150 + 7
 
 
@@ -721,3 +722,416 @@ def test_grand_total_tokens_sums_projects(tmp_path: Path):
     g = reg.grand_total_tokens()
     assert g["input"] == 30  # 10 + 20
     assert g["output"] == 15  # 5 + 10
+
+
+# ---------- task_markers: emit + scan + derive ----------
+
+def test_emit_and_scan_task_boundaries(tmp_path: Path):
+    from rufler.task_markers import emit_task_marker, scan_task_boundaries
+    log = tmp_path / "tasks.log"
+    emit_task_marker(log, "task_start", task_id="abc12345.01", slot=1, name="schema")
+    # Simulate some claude output between markers.
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"src": "claude", "type": "assistant", "message": {}}) + "\n")
+    emit_task_marker(log, "task_end", task_id="abc12345.01", slot=1, rc=0)
+    boundaries = scan_task_boundaries(log)
+    assert "abc12345.01" in boundaries
+    tb = boundaries["abc12345.01"]
+    assert tb.started is True
+    assert tb.ended is True
+    assert tb.rc == 0
+    assert tb.slot == 1
+    assert tb.name == "schema"
+    assert tb.start_offset is not None
+    assert tb.end_offset is not None
+    assert tb.start_offset < tb.end_offset
+
+
+def test_scan_task_boundaries_missing_file(tmp_path: Path):
+    from rufler.task_markers import scan_task_boundaries
+    assert scan_task_boundaries(tmp_path / "nope.log") == {}
+
+
+def test_derive_task_status_queued():
+    from rufler.task_markers import derive_task_status
+    assert derive_task_status(None, run_status="running", run_rc=None) == "queued"
+
+
+def test_derive_task_status_running():
+    from rufler.task_markers import derive_task_status, TaskBoundary
+    tb = TaskBoundary(task_id="x.01", slot=1, started=True, ended=False)
+    assert derive_task_status(tb, run_status="running", run_rc=None) == "running"
+
+
+def test_derive_task_status_exited():
+    from rufler.task_markers import derive_task_status, TaskBoundary
+    tb = TaskBoundary(task_id="x.01", slot=1, started=True, ended=True, rc=0)
+    assert derive_task_status(tb, run_status="exited", run_rc=0) == "exited"
+
+
+def test_derive_task_status_failed():
+    from rufler.task_markers import derive_task_status, TaskBoundary
+    tb = TaskBoundary(task_id="x.01", slot=1, started=True, ended=True, rc=1)
+    assert derive_task_status(tb, run_status="failed", run_rc=1) == "failed"
+
+
+def test_derive_task_status_stopped():
+    from rufler.task_markers import derive_task_status, TaskBoundary
+    tb = TaskBoundary(task_id="x.01", slot=1, started=True, ended=False)
+    assert derive_task_status(tb, run_status="stopped", run_rc=None) == "stopped"
+
+
+def test_derive_task_status_skipped():
+    from rufler.task_markers import derive_task_status
+    assert derive_task_status(None, run_status="exited", run_rc=0) == "skipped"
+
+
+# ---------- per-task token accounting ----------
+
+def test_parse_log_range_slices_by_offsets(tmp_path: Path):
+    from rufler.tokens import parse_log_range
+    log = tmp_path / "multi.log"
+    line1 = json.dumps({
+        "src": "claude", "type": "assistant",
+        "message": {"id": "m1", "usage": {"input_tokens": 100, "output_tokens": 50}},
+    }) + "\n"
+    line2 = json.dumps({"src": "rufler", "type": "task_end", "task_id": "x.01"}) + "\n"
+    line3 = json.dumps({
+        "src": "claude", "type": "assistant",
+        "message": {"id": "m2", "usage": {"input_tokens": 200, "output_tokens": 80}},
+    }) + "\n"
+    log.write_bytes(line1.encode() + line2.encode() + line3.encode())
+
+    # parse_log_range skips one line after seeking (to handle landing
+    # mid-record), so split_offset should point to the START of the marker
+    # line. readline() then skips the marker, and the loop picks up line3.
+    split_offset = len(line1.encode())
+
+    # Full scan gets everything
+    full = parse_log_range(log)
+    assert full.input_tokens == 300
+    assert full.output_tokens == 130
+
+    # Slice only task 2 (from split_offset onward)
+    t2 = parse_log_range(log, start_offset=split_offset)
+    assert t2.input_tokens == 200
+    assert t2.output_tokens == 80
+
+    # Slice only task 1 (up to split_offset)
+    t1 = parse_log_range(log, end_offset=split_offset)
+    assert t1.input_tokens == 100
+    assert t1.output_tokens == 50
+
+
+# ---------- TaskEntry in RunEntry roundtrip ----------
+
+def test_task_entry_roundtrip_in_registry(tmp_path: Path):
+    reg = Registry(path=tmp_path / "r.json")
+    e = new_entry(
+        project="task-rt", flow_file=tmp_path / "f.yml", base_dir=tmp_path,
+        mode="foreground", run_mode="sequential", log_path=tmp_path / "x.log",
+    )
+    e.tasks = [
+        TaskEntry(
+            name="build", log_path=str(tmp_path / "build.log"),
+            id="abc.01", slot=1, source="group",
+            started_at=1000.0, finished_at=1060.0, rc=0,
+            input_tokens=42, output_tokens=10,
+        ),
+        TaskEntry(
+            name="test", log_path=str(tmp_path / "test.log"),
+            id="abc.02", slot=2, source="group",
+        ),
+    ]
+    reg.add(e)
+    loaded = reg.list_all()
+    assert len(loaded) == 1
+    assert len(loaded[0].tasks) == 2
+    t1, t2 = loaded[0].tasks
+    assert t1.id == "abc.01"
+    assert t1.name == "build"
+    assert t1.slot == 1
+    assert t1.source == "group"
+    assert t1.started_at == 1000.0
+    assert t1.finished_at == 1060.0
+    assert t1.rc == 0
+    assert t1.input_tokens == 42
+    assert t2.id == "abc.02"
+    assert t2.name == "test"
+    assert t2.started_at is None
+
+
+# ---------- rufler tasks CLI integration ----------
+
+def _patch_registry(monkeypatch, reg: Registry):
+    """Patch Registry() to always use `reg`'s path, across all modules."""
+    real_init = Registry.__init__
+
+    def patched_init(self, path=None):
+        real_init(self, path=reg.path)
+
+    monkeypatch.setattr(Registry, "__init__", patched_init)
+
+
+def test_tasks_cmd_renders_table(tmp_path: Path, monkeypatch):
+    from typer.testing import CliRunner
+    from rufler.cli import app
+    from rufler.task_markers import emit_task_marker
+
+    log = tmp_path / ".rufler" / "run.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    emit_task_marker(log, "task_start", task_id="dead0001.01", slot=1, name="build")
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "src": "claude", "type": "assistant",
+            "message": {"usage": {"input_tokens": 500, "output_tokens": 120}},
+        }) + "\n")
+    emit_task_marker(log, "task_end", task_id="dead0001.01", slot=1, rc=0)
+
+    reg = Registry(path=tmp_path / ".rufler" / "registry.json")
+    e = RunEntry(
+        id="dead0001",
+        project="test-proj",
+        flow_file=str(tmp_path / "rufler_flow.yml"),
+        base_dir=str(tmp_path),
+        mode="foreground",
+        run_mode="sequential",
+        started_at=time.time() - 60,
+        finished_at=time.time(),
+        pids=[99999999],
+        log_path=str(log),
+        tasks=[
+            TaskEntry(
+                name="build", log_path=str(log),
+                id="dead0001.01", slot=1, source="group",
+                started_at=time.time() - 60, finished_at=time.time(), rc=0,
+            ),
+        ],
+    )
+    reg.add(e)
+
+    monkeypatch.chdir(tmp_path)
+    _patch_registry(monkeypatch, reg)
+
+    result = CliRunner().invoke(app, ["tasks", "dead0001"])
+    assert result.exit_code == 0, result.output
+    assert "dead0001.01" in result.output
+    assert "build" in result.output
+    assert "1 done" in result.output
+
+
+def test_tasks_cmd_verbose_detail(tmp_path: Path, monkeypatch):
+    from typer.testing import CliRunner
+    from rufler.cli import app
+    from rufler.task_markers import emit_task_marker
+
+    log = tmp_path / ".rufler" / "run.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    emit_task_marker(log, "task_start", task_id="beef0002.01", slot=1, name="deploy")
+    emit_task_marker(log, "task_end", task_id="beef0002.01", slot=1, rc=0)
+
+    reg = Registry(path=tmp_path / ".rufler" / "registry.json")
+    e = RunEntry(
+        id="beef0002",
+        project="detail-proj",
+        flow_file=str(tmp_path / "rufler_flow.yml"),
+        base_dir=str(tmp_path),
+        mode="foreground",
+        run_mode="sequential",
+        started_at=time.time() - 30,
+        finished_at=time.time(),
+        pids=[99999999],
+        log_path=str(log),
+        tasks=[
+            TaskEntry(
+                name="deploy", log_path=str(log),
+                id="beef0002.01", slot=1, source="main",
+                started_at=time.time() - 30, finished_at=time.time(), rc=0,
+            ),
+        ],
+    )
+    reg.add(e)
+
+    monkeypatch.chdir(tmp_path)
+    _patch_registry(monkeypatch, reg)
+
+    result = CliRunner().invoke(app, ["tasks", "beef0002.01", "-v"])
+    assert result.exit_code == 0, result.output
+    assert "beef0002.01" in result.output
+    assert "deploy" in result.output
+    assert "TOTAL" in result.output
+
+
+# ---------- resume logic ----------
+
+def test_find_resumable_run_returns_latest_finished(tmp_path: Path):
+    from rufler.tasks import find_resumable_run
+    reg = Registry(path=tmp_path / "r.json")
+    flow = tmp_path / "flow.yml"
+    flow.touch()
+
+    old = new_entry(
+        project="p", flow_file=flow, base_dir=tmp_path,
+        mode="foreground", run_mode="sequential", log_path=tmp_path / "old.log",
+    )
+    old.finished_at = time.time() - 100
+    old.pids = [99999999]
+    old.tasks = [TaskEntry(name="t1", log_path="x", id="old.01", slot=1, rc=0,
+                           started_at=1.0, finished_at=2.0)]
+    reg.add(old)
+
+    newer = new_entry(
+        project="p", flow_file=flow, base_dir=tmp_path,
+        mode="foreground", run_mode="sequential", log_path=tmp_path / "new.log",
+    )
+    newer.finished_at = time.time() - 10
+    newer.pids = [99999999]
+    newer.tasks = [TaskEntry(name="t1", log_path="x", id="new.01", slot=1, rc=0,
+                             started_at=3.0, finished_at=4.0)]
+    reg.add(newer)
+
+    found = find_resumable_run(reg, tmp_path, flow)
+    assert found is not None
+    assert found.id == newer.id
+
+
+def test_find_resumable_run_skips_running(tmp_path: Path):
+    from rufler.tasks import find_resumable_run
+    reg = Registry(path=tmp_path / "r.json")
+    flow = tmp_path / "flow.yml"
+    flow.touch()
+
+    e = new_entry(
+        project="p", flow_file=flow, base_dir=tmp_path,
+        mode="foreground", run_mode="sequential", log_path=tmp_path / "x.log",
+    )
+    e.pids = [os.getpid()]
+    e.pid_starttimes = [_pid_starttime(os.getpid()) or 0]
+    e.tasks = [TaskEntry(name="t1", log_path="x", id="e.01", slot=1)]
+    reg.add(e)
+
+    found = find_resumable_run(reg, tmp_path, flow)
+    assert found is None
+
+
+def test_find_resumable_run_no_match_different_dir(tmp_path: Path):
+    from rufler.tasks import find_resumable_run
+    reg = Registry(path=tmp_path / "r.json")
+    flow = tmp_path / "flow.yml"
+    flow.touch()
+    other = tmp_path / "other"
+    other.mkdir()
+
+    e = new_entry(
+        project="p", flow_file=flow, base_dir=other,
+        mode="foreground", run_mode="sequential", log_path=other / "x.log",
+    )
+    e.finished_at = time.time()
+    e.pids = [99999999]
+    e.tasks = [TaskEntry(name="t1", log_path="x", id="e.01", slot=1, rc=0,
+                         started_at=1.0, finished_at=2.0)]
+    reg.add(e)
+
+    found = find_resumable_run(reg, tmp_path, flow)
+    assert found is None
+
+
+def test_completed_task_names_filters_rc_zero():
+    from rufler.tasks import completed_task_names
+    e = RunEntry(
+        id="abc", project="p", flow_file="f", base_dir="/tmp",
+        mode="fg", run_mode="seq", started_at=1.0,
+        tasks=[
+            TaskEntry(name="done1", log_path="x", id="a.01", slot=1,
+                      rc=0, started_at=1.0, finished_at=2.0),
+            TaskEntry(name="failed", log_path="x", id="a.02", slot=2,
+                      rc=1, started_at=3.0, finished_at=4.0),
+            TaskEntry(name="pending", log_path="x", id="a.03", slot=3),
+            TaskEntry(name="done2", log_path="x", id="a.04", slot=4,
+                      rc=0, started_at=5.0, finished_at=6.0),
+        ],
+    )
+    done = completed_task_names(e)
+    assert set(done.keys()) == {"done1", "done2"}
+    assert done["done1"].slot == 1
+    assert done["done2"].slot == 4
+
+
+def test_decompose_reuses_existing_files(tmp_path: Path):
+    import yaml as _yaml
+    from rufler.config import FlowConfig, TaskSpec
+
+    tasks_dir = tmp_path / ".rufler" / "tasks"
+    tasks_dir.mkdir(parents=True)
+    (tasks_dir / "task_1.md").write_text("# Task 1\nDo thing one\n", encoding="utf-8")
+    (tasks_dir / "task_2.md").write_text("# Task 2\nDo thing two\n", encoding="utf-8")
+
+    yml_out = tasks_dir / "decomposed_tasks.yml"
+    companion = {
+        "task": {
+            "multi": True,
+            "run_mode": "sequential",
+            "group": [
+                {"name": "task_1", "file_path": "task_1.md"},
+                {"name": "task_2", "file_path": "task_2.md"},
+            ],
+        }
+    }
+    yml_out.write_text(_yaml.safe_dump(companion), encoding="utf-8")
+
+    cfg = FlowConfig()
+    cfg.base_dir = tmp_path
+    cfg.task = TaskSpec(
+        main="big task",
+        multi=True,
+        decompose=True,
+        decompose_file=".rufler/tasks/decomposed_tasks.yml",
+        decompose_dir=".rufler/tasks",
+    )
+
+    class StubConsole:
+        def rule(self, *a, **kw): pass
+        def print(self, *a, **kw): pass
+
+    from rufler.run_steps import decompose_task_group
+    decompose_task_group(cfg, StubConsole(), force_new=False)
+
+    assert len(cfg.task.group) == 2
+    assert cfg.task.group[0].name == "task_1"
+    assert cfg.task.group[1].name == "task_2"
+
+
+def test_decompose_ignores_existing_when_force_new(tmp_path: Path):
+    """With force_new=True, decompose should NOT reuse files.
+    Since we don't have claude in tests, it will fail — which proves
+    it tried to call the decomposer instead of reusing."""
+    import yaml as _yaml
+    from rufler.config import FlowConfig, TaskSpec
+
+    tasks_dir = tmp_path / ".rufler" / "tasks"
+    tasks_dir.mkdir(parents=True)
+    (tasks_dir / "task_1.md").write_text("# old\n", encoding="utf-8")
+
+    yml_out = tasks_dir / "decomposed_tasks.yml"
+    companion = {"task": {"multi": True, "run_mode": "sequential",
+                          "group": [{"name": "task_1", "file_path": "task_1.md"}]}}
+    yml_out.write_text(_yaml.safe_dump(companion), encoding="utf-8")
+
+    cfg = FlowConfig()
+    cfg.base_dir = tmp_path
+    cfg.task = TaskSpec(
+        main="big task",
+        multi=True,
+        decompose=True,
+        decompose_file=".rufler/tasks/decomposed_tasks.yml",
+        decompose_dir=".rufler/tasks",
+    )
+
+    class StubConsole:
+        def rule(self, *a, **kw): pass
+        def print(self, *a, **kw): pass
+
+    from rufler.run_steps import decompose_task_group
+    from click.exceptions import Exit
+    with pytest.raises(Exit):
+        decompose_task_group(cfg, StubConsole(), force_new=True)

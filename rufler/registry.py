@@ -170,9 +170,53 @@ class ProjectEntry:
 
 @dataclass
 class TaskEntry:
+    """One row per task inside a run.
+
+    Populated eagerly by `rufler run` *before* spawn so the task is visible
+    on `rufler tasks` even while queued. `started_at`/`finished_at`/`rc` and
+    per-task token totals are backfilled as the run progresses — either by
+    the orchestrator writing `task_start`/`task_end` markers into the NDJSON
+    log, or (parallel mode) derived from the existing `log ended rc=` tail
+    marker.
+
+    `id` is `<run_id>.<slot2>` e.g. `a1b2c3d4.01`.
+    """
     name: str
     log_path: str
     pid: Optional[int] = None
+    id: str = ""
+    slot: int = 0
+    source: str = "inline"          # inline | group | decomposed | main
+    file_path: Optional[str] = None
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    rc: Optional[int] = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read: int = 0
+    cache_creation: int = 0
+
+    # Non-persisted, recomputed on read.
+    status: str = field(default="queued", repr=False)
+
+    _PERSISTED = (
+        "name", "log_path", "pid", "id", "slot", "source", "file_path",
+        "started_at", "finished_at", "rc",
+        "input_tokens", "output_tokens", "cache_read", "cache_creation",
+    )
+
+    def to_dict(self) -> dict:
+        full = asdict(self)
+        return {k: full[k] for k in self._PERSISTED if k in full}
+
+    @property
+    def total_tokens(self) -> int:
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_read
+            + self.cache_creation
+        )
 
     @classmethod
     def from_dict(cls, d: dict) -> "TaskEntry":
@@ -227,7 +271,7 @@ class RunEntry:
     def to_dict(self) -> dict:
         full = asdict(self)
         d = {k: full[k] for k in self._PERSISTED if k in full}
-        d["tasks"] = [asdict(t) for t in self.tasks]
+        d["tasks"] = [t.to_dict() for t in self.tasks]
         return d
 
     @classmethod
