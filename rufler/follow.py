@@ -153,9 +153,17 @@ class TuiState:
                 return
 
             if "log started" in text:
-                self.status = "starting"
+                if self.status == "starting":
+                    self.status = "running"
             elif "log ended" in text:
-                self.status = "done" if "rc=0" in text else "failed"
+                # In multi-task mode each task has its own "log ended".
+                # Only mark the whole run done when no tasks remain.
+                has_remaining = any(
+                    ti.status in ("queued", "running")
+                    for ti in self.task_list
+                )
+                if not has_remaining:
+                    self.status = "done" if "rc=0" in text else "failed"
             if text:
                 self._push_event(ts, rec.get("level") or "debug", text)
             return
@@ -288,12 +296,20 @@ class TuiState:
             if t == "result":
                 ok = (rec.get("subtype") == "success"
                       and not rec.get("is_error"))
-                self.status = "done" if ok else "failed"
                 result_text = rec.get("result", "")[:80]
                 sym = "✓" if ok else "✗"
                 self._push_event(
                     ts, "ok" if ok else "error",
                     f"RESULT {sym} {result_text}")
+                # In multi-task mode, a `result` event ends one claude
+                # session (one task), not the entire run. Only set
+                # status=done when there are no more tasks to run.
+                has_remaining = any(
+                    ti.status in ("queued", "running")
+                    for ti in self.task_list
+                )
+                if not has_remaining:
+                    self.status = "done" if ok else "failed"
                 return
 
             if t == "rate_limit_event":
