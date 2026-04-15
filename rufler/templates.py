@@ -74,6 +74,27 @@ skills:
                             # entry resolves to a skills.sh install so missing
                             # npx/network fails fast before `rufler run`.
 
+# MCP servers to register with Claude Code before the swarm runs.
+# Each server is added via `claude mcp add -s project` so it stays
+# local to this project. ruflo's own MCP is added by `ruflo init`
+# automatically — only declare additional servers here.
+# mcp:
+#   servers:
+#     - name: my-db
+#       command: npx
+#       args: ["-y", "@anthropic/mcp-postgres"]
+#       env:
+#         DATABASE_URL: "postgresql://localhost/mydb"
+#
+#     - name: filesystem
+#       command: npx
+#       args: ["-y", "@anthropic/mcp-filesystem", "/home/user/docs"]
+#
+#     # HTTP transport (e.g. remote MCP)
+#     - name: sentry
+#       transport: http
+#       url: "https://mcp.sentry.dev/mcp"
+
 agents:
   - name: architect
     type: system-architect

@@ -226,6 +226,102 @@ def skills_cmd(
         )
 
 
+@app.command("mcp")
+def mcp_cmd(
+    config: Path = typer.Option(
+        Path(DEFAULT_FLOW_FILE), "--config", "-c", help="Path to rufler_flow.yml"
+    ),
+    active: bool = typer.Option(
+        False, "--active",
+        help="Show MCP servers actually registered in ~/.claude.json for this project",
+    ),
+):
+    """List MCP servers declared in rufler_flow.yml or registered with Claude Code.
+
+    Without flags: shows what the yml declares under `mcp.servers`.
+    With --active: reads ~/.claude.json and shows what's actually registered
+    for this project's directory.
+    """
+    if active:
+        import json as _json
+        claude_json = Path.home() / ".claude.json"
+        if not claude_json.exists():
+            console.print("[yellow]~/.claude.json not found[/yellow]")
+            raise typer.Exit(0)
+        try:
+            data = _json.loads(claude_json.read_text(encoding="utf-8"))
+        except Exception as e:
+            console.print(f"[red]failed to read ~/.claude.json:[/red] {e}")
+            raise typer.Exit(1)
+        cwd_resolved = str(Path.cwd().resolve())
+        projects = data.get("projects") or {}
+        proj = projects.get(cwd_resolved) or {}
+        servers = proj.get("mcpServers") or {}
+        if not servers:
+            console.print(
+                f"[yellow]no MCP servers registered[/yellow] for {cwd_resolved}"
+            )
+            raise typer.Exit(0)
+        table = Table(title=f"active MCP servers — {cwd_resolved}", show_lines=False)
+        table.add_column("NAME", style="cyan", no_wrap=True)
+        table.add_column("TYPE", style="dim")
+        table.add_column("COMMAND / URL")
+        table.add_column("ARGS", overflow="fold", style="dim")
+        for name, cfg in servers.items():
+            transport = cfg.get("type", "stdio")
+            if transport == "stdio":
+                cmd_or_url = cfg.get("command", "-")
+                args = " ".join(str(a) for a in cfg.get("args", []))
+            else:
+                cmd_or_url = cfg.get("url", "-")
+                args = ""
+            table.add_row(name, transport, cmd_or_url, args)
+        console.print(table)
+        console.print(f"[dim]{len(servers)} server(s)[/dim]")
+        return
+
+    cfg_path = config.resolve()
+    if not cfg_path.exists():
+        console.print(
+            f"[red]{cfg_path} not found.[/red] Run [bold]rufler init[/bold] first."
+        )
+        raise typer.Exit(1)
+    try:
+        from .config import FlowConfig
+        cfg = FlowConfig.load(cfg_path)
+    except Exception as e:
+        console.print(f"[red]Failed to load config:[/red] {e}")
+        raise typer.Exit(1)
+
+    servers = cfg.mcp.servers
+    if not servers:
+        console.print(
+            "[yellow]no MCP servers declared[/yellow] in "
+            f"[cyan]{cfg_path.name}[/cyan]\n"
+            "[dim]add an `mcp.servers` section to your flow yml[/dim]"
+        )
+        raise typer.Exit(0)
+
+    table = Table(title=f"MCP servers — {cfg_path.name}", show_lines=False)
+    table.add_column("NAME", style="cyan", no_wrap=True)
+    table.add_column("TRANSPORT", style="dim")
+    table.add_column("COMMAND / URL")
+    table.add_column("ARGS", overflow="fold", style="dim")
+    table.add_column("ENV", overflow="fold", style="dim")
+    for s in servers:
+        if s.transport == "stdio":
+            cmd_or_url = s.command
+            args = " ".join(s.args)
+        else:
+            cmd_or_url = s.url
+            args = ""
+        env_str = " ".join(f"{k}={v}" for k, v in s.env.items()) if s.env else ""
+        table.add_row(s.name, s.transport, cmd_or_url, args, env_str)
+    console.print(table)
+    console.print(
+        f"[dim]{len(servers)} server(s) — "
+        f"use [bold]--active[/bold] to see what's registered with claude[/dim]"
+    )
 
 
 @app.command()

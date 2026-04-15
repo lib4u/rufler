@@ -15,7 +15,7 @@ from rich.table import Table
 from .checks import check_all, check_skills_sh_cli
 from .config import FlowConfig, SkillsShEntry
 from .process import DEFAULT_FLOW_FILE
-from .runner import Runner
+from .runner import Runner, apply_mcp_servers
 from .skills import install_skills
 
 
@@ -88,6 +88,8 @@ def init_swarm_stack(
         if cfg.memory.init:
             runner.memory_init(backend=cfg.memory.backend)
         install_skills(runner, cfg, console)
+        if cfg.mcp.servers:
+            apply_mcp_servers(cfg.mcp.servers, cfg.base_dir, console)
 
     console.rule("[bold]2. swarm init[/bold]")
     runner.swarm_init(cfg.swarm.topology, cfg.swarm.max_agents, cfg.swarm.strategy)

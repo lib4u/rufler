@@ -60,6 +60,7 @@ In short: `ruflo` is the engine, `rufler` is the ignition + dashboard + cruise c
 - **Typed dataclass config** — schema validation, role/seniority checks, unknown-key tolerance.
 - **External prompts** — agents and tasks can be inline OR loaded from `.md` files, so prompts stay out of YAML.
 - **[skills.sh](https://skills.sh) integration** — pull third-party Claude Code skills straight from the yml. Drop a repo URL, an `owner/repo` shorthand, or paste a full `skills add …` command into `skills.custom`; rufler shells out to `npx skills add` pre-run, verifies each `SKILL.md` landed, and reports results in the plan banner. Mix-and-match with local paths and ruflo's built-in packs in the same list.
+- **MCP server management** — declare MCP servers in `mcp.servers` and rufler registers them with Claude Code via `claude mcp add` during init. Supports stdio, http, and sse transports with env vars and headers. `rufler mcp` inspects what's declared vs registered.
 - **Graceful shutdown** — `rufler stop` ends the session cleanly and writes post-task hooks.
 
 ---
@@ -134,6 +135,7 @@ rufler stop
 | `rufler run [FLOW_FILE]` | Validate config, run ruflo init/daemon/memory/swarm/hive-mind, spawn the Claude swarm. Foreground by default; Ctrl+C kills. Add `-d` to detach. Resumes from last completed task by default; `--new` to start fresh, `--from N` to resume from slot N. |
 | `rufler build [FLOW_FILE]` | Same preparation pipeline as `rufler run` (checks → ruflo init → daemon → memory → swarm → hive-mind → skills install) **without** launching Claude. Useful to apply yml changes (skills, memory, swarm) to an existing project. `--skip-init` skips the ruflo init + daemon step for quick re-builds. |
 | `rufler skills` | Inspect installed skills in `<project>/.claude/skills/` and show the yml snapshot. `--available` lists packs/skills in ruflo's bundled source tree. `--delete` wipes non-symlinked skill dirs from the project (with confirmation; `-y` to skip). |
+| `rufler mcp` | List MCP servers declared in `rufler_flow.yml`. `--active` shows what's actually registered in `~/.claude.json` for this project. Servers are added via `claude mcp add` during `rufler run`/`build`. |
 | `rufler ps [ID]` | Docker-style list of runs. No args → running only. `-a` → all. `--prune` / `--prune-older-than-days N` → clean stale entries. With an ID → detailed view of one run (status, tasks, claude procs, log tail). |
 | `rufler tasks [ID]` | List tasks for a run with sub-ids, status, tokens, timing. Without id → latest run in cwd. `-a` → all runs. `--status running` → filter. Pass a task sub-id (e.g. `a1b2c3d4.01 -v`) for a detailed card with token breakdown and recent log events. |
 | `rufler projects` | Per-project rollup: last run id, when it last ran, total runs. Survives `rufler rm` and pruning. |
@@ -254,6 +256,25 @@ execution:
   background: false                   # detach from terminal
   log_file: .rufler/run.log
 
+# MCP servers — registered with Claude Code via `claude mcp add -s project`
+mcp:
+  servers:
+    - name: my-db                       # server name (unique, required)
+      command: npx                      # executable (required for stdio)
+      args: ["-y", "@anthropic/mcp-postgres"]
+      env:
+        DATABASE_URL: "postgresql://localhost/mydb"
+
+    - name: sentry                      # HTTP transport example
+      transport: http                   # stdio (default) | http | sse
+      url: "https://mcp.sentry.dev/mcp"
+
+    - name: corridor                    # HTTP with auth headers
+      transport: http
+      url: "https://app.corridor.dev/api/mcp"
+      headers:
+        Authorization: "Bearer ${CORRIDOR_TOKEN}"
+
 agents:
   - name: architect
     type: system-architect            # any ruflo agent type, or custom string
@@ -279,6 +300,7 @@ agents:
 - Each agent needs `prompt` OR `prompt_path`.
 - `agent.depends_on` must be a list of known agent names. Self-deps and cycles are rejected at load time. `null` and `[]` are equivalent (no deps). Duplicates are deduped.
 - `task.run_mode` ∈ `{sequential, parallel}`.
+- `mcp.servers[*].transport` ∈ `{stdio, http, sse}`. stdio requires `command`, http/sse require `url`. Duplicate names are rejected.
 - `task.group` may be a list or a dict — both are accepted.
 - Unknown keys inside `group` items are ignored (forward-compatible).
 

@@ -1135,3 +1135,133 @@ def test_decompose_ignores_existing_when_force_new(tmp_path: Path):
     from click.exceptions import Exit
     with pytest.raises(Exit):
         decompose_task_group(cfg, StubConsole(), force_new=True)
+
+
+# ---------- MCP config parsing ----------
+
+def _write_flow_with_mcp(tmp_path: Path, mcp_yaml: str) -> Path:
+    p = tmp_path / "rufler_flow.yml"
+    p.write_text(
+        "project:\n  name: mcp-test\n"
+        "task:\n  main: x\n"
+        f"mcp:\n{mcp_yaml}\n"
+        "agents:\n"
+        "  - {name: a, type: coder, role: worker, seniority: junior, prompt: p}\n",
+        encoding="utf-8",
+    )
+    return p
+
+
+def test_mcp_parses_stdio_server(tmp_path: Path):
+    from rufler.config import FlowConfig, McpServerSpec
+    p = _write_flow_with_mcp(tmp_path,
+        "  servers:\n"
+        "    - name: my-db\n"
+        "      command: npx\n"
+        "      args: ['-y', '@anthropic/mcp-postgres']\n"
+        "      env:\n"
+        "        DATABASE_URL: 'postgresql://localhost/mydb'\n"
+    )
+    cfg = FlowConfig.load(p)
+    assert len(cfg.mcp.servers) == 1
+    s = cfg.mcp.servers[0]
+    assert s.name == "my-db"
+    assert s.command == "npx"
+    assert s.args == ["-y", "@anthropic/mcp-postgres"]
+    assert s.env == {"DATABASE_URL": "postgresql://localhost/mydb"}
+    assert s.transport == "stdio"
+
+
+def test_mcp_parses_http_server(tmp_path: Path):
+    from rufler.config import FlowConfig
+    p = _write_flow_with_mcp(tmp_path,
+        "  servers:\n"
+        "    - name: sentry\n"
+        "      transport: http\n"
+        "      url: 'https://mcp.sentry.dev/mcp'\n"
+    )
+    cfg = FlowConfig.load(p)
+    s = cfg.mcp.servers[0]
+    assert s.transport == "http"
+    assert s.url == "https://mcp.sentry.dev/mcp"
+    assert s.command == ""
+
+
+def test_mcp_parses_http_with_headers(tmp_path: Path):
+    from rufler.config import FlowConfig
+    p = _write_flow_with_mcp(tmp_path,
+        "  servers:\n"
+        "    - name: corridor\n"
+        "      transport: http\n"
+        "      url: 'https://app.corridor.dev/api/mcp'\n"
+        "      headers:\n"
+        "        Authorization: 'Bearer token123'\n"
+    )
+    cfg = FlowConfig.load(p)
+    s = cfg.mcp.servers[0]
+    assert s.headers == {"Authorization": "Bearer token123"}
+
+
+def test_mcp_rejects_duplicate_names(tmp_path: Path):
+    from rufler.config import FlowConfig
+    p = _write_flow_with_mcp(tmp_path,
+        "  servers:\n"
+        "    - name: dup\n"
+        "      command: echo\n"
+        "    - name: dup\n"
+        "      command: echo\n"
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        FlowConfig.load(p)
+
+
+def test_mcp_rejects_stdio_without_command(tmp_path: Path):
+    from rufler.config import FlowConfig
+    p = _write_flow_with_mcp(tmp_path,
+        "  servers:\n"
+        "    - name: broken\n"
+    )
+    with pytest.raises(ValueError, match="command"):
+        FlowConfig.load(p)
+
+
+def test_mcp_rejects_http_without_url(tmp_path: Path):
+    from rufler.config import FlowConfig
+    p = _write_flow_with_mcp(tmp_path,
+        "  servers:\n"
+        "    - name: broken\n"
+        "      transport: http\n"
+    )
+    with pytest.raises(ValueError, match="url"):
+        FlowConfig.load(p)
+
+
+def test_mcp_rejects_unknown_fields(tmp_path: Path):
+    from rufler.config import FlowConfig
+    p = _write_flow_with_mcp(tmp_path,
+        "  servers:\n"
+        "    - name: bad\n"
+        "      command: echo\n"
+        "      bogus: true\n"
+    )
+    with pytest.raises(ValueError, match="unknown"):
+        FlowConfig.load(p)
+
+
+def test_mcp_empty_servers_is_valid(tmp_path: Path):
+    from rufler.config import FlowConfig
+    p = _write_flow_with_mcp(tmp_path, "  servers: []\n")
+    cfg = FlowConfig.load(p)
+    assert cfg.mcp.servers == []
+
+
+def test_mcp_no_section_defaults_empty(tmp_path: Path):
+    from rufler.config import FlowConfig
+    p = tmp_path / "rufler_flow.yml"
+    p.write_text(
+        "project:\n  name: no-mcp\ntask:\n  main: x\n"
+        "agents:\n  - {name: a, type: coder, role: worker, seniority: junior, prompt: p}\n",
+        encoding="utf-8",
+    )
+    cfg = FlowConfig.load(p)
+    assert cfg.mcp.servers == []

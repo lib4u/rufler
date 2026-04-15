@@ -481,6 +481,57 @@ class ProjectSpec:
 
 
 @dataclass
+class McpServerSpec:
+    """One MCP server to register with Claude Code via `claude mcp add`."""
+    name: str
+    command: str = ""
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    transport: str = "stdio"
+    url: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        if not self.name or not self.name.strip():
+            raise ValueError("mcp.servers: each entry must have a non-empty 'name'")
+        self.name = self.name.strip()
+        if self.transport not in ("stdio", "http", "sse"):
+            raise ValueError(
+                f"mcp.servers '{self.name}': transport must be stdio, http, or sse, "
+                f"got '{self.transport}'"
+            )
+        if self.transport == "stdio":
+            if not self.command:
+                raise ValueError(
+                    f"mcp.servers '{self.name}': stdio transport requires 'command'"
+                )
+        else:
+            if not self.url:
+                raise ValueError(
+                    f"mcp.servers '{self.name}': {self.transport} transport requires 'url'"
+                )
+
+
+@dataclass
+class McpSpec:
+    """MCP servers to register with Claude Code before the swarm runs."""
+    servers: list[McpServerSpec] = field(default_factory=list)
+
+    def validate(self) -> None:
+        seen: set[str] = set()
+        for s in self.servers:
+            s.validate()
+            if s.name in seen:
+                raise ValueError(
+                    f"mcp.servers: duplicate name '{s.name}'"
+                )
+            seen.add(s.name)
+
+
+VALID_MCP_SERVER_FIELDS = set(McpServerSpec.__dataclass_fields__)
+
+
+@dataclass
 class ExecutionSpec:
     """How `rufler start` should launch the Claude Code swarm.
     CLI flags override these values."""
@@ -498,6 +549,7 @@ class FlowConfig:
     task: TaskSpec = field(default_factory=TaskSpec)
     execution: ExecutionSpec = field(default_factory=ExecutionSpec)
     skills: SkillsSpec = field(default_factory=SkillsSpec)
+    mcp: McpSpec = field(default_factory=McpSpec)
     agents: list[AgentSpec] = field(default_factory=list)
     base_dir: Path = field(default_factory=Path.cwd)
 
@@ -533,6 +585,28 @@ class FlowConfig:
                 raw_skills["custom"] = list(raw_skills.get("custom") or []) + legacy_sh
             cfg.skills = SkillsSpec(**raw_skills)
             cfg.skills.validate()
+        if isinstance(data.get("mcp"), dict):
+            raw_mcp = data["mcp"]
+            servers_raw = raw_mcp.get("servers") or []
+            if not isinstance(servers_raw, list):
+                raise ValueError(
+                    f"mcp.servers must be a list, got {type(servers_raw).__name__}"
+                )
+            mcp_servers: list[McpServerSpec] = []
+            for i, s in enumerate(servers_raw):
+                if not isinstance(s, dict):
+                    raise ValueError(
+                        f"mcp.servers[{i}] must be a dict, got {type(s).__name__}"
+                    )
+                unknown = set(s.keys()) - VALID_MCP_SERVER_FIELDS
+                if unknown:
+                    raise ValueError(
+                        f"mcp.servers[{i}]: unknown field(s) {sorted(unknown)} "
+                        f"(allowed: {sorted(VALID_MCP_SERVER_FIELDS)})"
+                    )
+                mcp_servers.append(McpServerSpec(**s))
+            cfg.mcp = McpSpec(servers=mcp_servers)
+            cfg.mcp.validate()
         for a in data.get("agents") or []:
             spec = AgentSpec(**a)
             spec.validate()

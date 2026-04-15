@@ -317,3 +317,96 @@ class Runner:
 
     def system_status(self):
         self.run(["status"])
+
+
+def _find_claude_bin() -> str | None:
+    import shutil
+    return shutil.which("claude")
+
+
+def apply_mcp_servers(
+    servers: list,
+    base_dir: Path,
+    con: Console,
+) -> None:
+    """Register MCP servers with Claude Code via `claude mcp add`.
+
+    Each server spec is translated to a `claude mcp add -s project ...`
+    call. Non-fatal: failures are reported as warnings.
+    """
+    if not servers:
+        return
+
+    claude = _find_claude_bin()
+    if not claude:
+        con.print(
+            "[yellow]mcp:[/yellow] `claude` binary not found — "
+            "skipping MCP server registration"
+        )
+        return
+
+    con.rule("[bold]1c. mcp servers[/bold]")
+    added: list[str] = []
+    failed: list[str] = []
+
+    for s in servers:
+        cmd: list[str] = [claude, "mcp", "add", "-s", "project"]
+
+        if s.transport != "stdio":
+            cmd.extend(["-t", s.transport])
+
+        for k, v in (s.env or {}).items():
+            cmd.extend(["-e", f"{k}={v}"])
+
+        for k, v in (s.headers or {}).items():
+            cmd.extend(["-H", f"{k}: {v}"])
+
+        cmd.append(s.name)
+
+        if s.transport == "stdio":
+            cmd.append("--")
+            cmd.append(s.command)
+            cmd.extend(s.args or [])
+        else:
+            cmd.append(s.url)
+
+        display = f"claude mcp add {s.name}"
+        con.print(f"[dim]$ {display}[/dim]")
+        try:
+            r = subprocess.run(
+                cmd,
+                cwd=base_dir,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if r.returncode == 0:
+                added.append(s.name)
+            else:
+                stderr = (r.stderr or "").strip()[:200]
+                con.print(
+                    f"[yellow]mcp:[/yellow] failed to add '{s.name}': "
+                    f"rc={r.returncode} {stderr}"
+                )
+                failed.append(s.name)
+        except subprocess.TimeoutExpired:
+            con.print(
+                f"[yellow]mcp:[/yellow] '{s.name}' timed out (15s) — skipping"
+            )
+            failed.append(s.name)
+        except FileNotFoundError:
+            con.print(
+                f"[yellow]mcp:[/yellow] `claude` binary disappeared — aborting"
+            )
+            return
+
+    if added:
+        con.print(
+            f"[green]mcp:[/green] registered {len(added)} server(s): "
+            f"{', '.join(added)}"
+        )
+    if failed:
+        con.print(
+            f"[yellow]mcp:[/yellow] {len(failed)} server(s) failed: "
+            f"{', '.join(failed)}"
+        )
