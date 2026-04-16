@@ -1,4 +1,4 @@
-"""Tasks subpackage — resolve, display, and inspect per-task state.
+"""Tasks subpackage — resolve, display, report, and inspect per-task state.
 
 Public API re-exported here so cli.py can do a single
 `from .tasks import resolve_tasks_for_entry, ...` instead of reaching
@@ -14,6 +14,15 @@ from .display import (
     render_tasks_table,
     render_tokens_by_task,
 )
+from .report import run_report
+from .chain import (
+    ChainedTask,
+    build_retrospective,
+    collect_chain_entry,
+    compress_task_context,
+    resolve_chain_flag,
+)
+from .deep_think import deep_think, build_deep_think_prompt
 
 __all__ = [
     "TASK_STATUS_COLORS",
@@ -26,4 +35,12 @@ __all__ = [
     "render_tasks_table",
     "render_tokens_by_task",
     "resolve_tasks_for_entry",
+    "run_report",
+    "ChainedTask",
+    "build_retrospective",
+    "collect_chain_entry",
+    "compress_task_context",
+    "resolve_chain_flag",
+    "deep_think",
+    "build_deep_think_prompt",
 ]

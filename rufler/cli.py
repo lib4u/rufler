@@ -36,6 +36,8 @@ from .task_markers import emit_task_marker, scan_task_boundaries
 from .tasks import (
     resolve_tasks_for_entry, render_tasks_table, render_task_detail,
     render_tokens_by_task, find_resumable_run, completed_task_names,
+    run_report,
+    collect_chain_entry, resolve_chain_flag,
 )
 from .tokens import fmt_tokens
 from .run_steps import (
@@ -43,6 +45,7 @@ from .run_steps import (
     finalize_run,
     print_run_plan,
     resolve_exec_overrides,
+    run_deep_think,
 )
 from .runner import Runner, ensure_bypass_permissions
 from .skills import (
@@ -427,26 +430,6 @@ def run_cmd(
         console.print("[red]No agents defined in rufler_flow.yml[/red]")
         raise typer.Exit(1)
 
-    decompose_task_group(cfg, console, force_new=new)
-
-    try:
-        tasks = cfg.task.iter_tasks(cfg.base_dir)
-    except (FileNotFoundError, ValueError) as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(1)
-    if not tasks:
-        console.print(
-            "[red]task is empty[/red] — set [bold]task.main[/bold], "
-            "[bold]task.main_path[/bold], or [bold]task.group[/bold]"
-        )
-        raise typer.Exit(1)
-
-    print_run_plan(cfg, tasks, console)
-
-    if dry_run:
-        console.print("[yellow]dry-run: stopping before executing ruflo[/yellow]")
-        raise typer.Exit(0)
-
     runner = Runner(cwd=cfg.base_dir)
     base_task_id = f"rufler-{cfg.project.name}-{int(time.time())}"
 
@@ -506,6 +489,29 @@ def run_cmd(
         )
 
     init_swarm_stack(runner, cfg, console, skip_init)
+
+    # Deep think + decompose run AFTER init_swarm_stack so that MCP servers,
+    # skills, memory, and swarm are all available to the claude -p sessions.
+    analysis = run_deep_think(cfg, console, force_new=new)
+    decompose_task_group(cfg, console, force_new=new, analysis=analysis)
+
+    try:
+        tasks = cfg.task.iter_tasks(cfg.base_dir)
+    except (FileNotFoundError, ValueError) as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    if not tasks:
+        console.print(
+            "[red]task is empty[/red] — set [bold]task.main[/bold], "
+            "[bold]task.main_path[/bold], or [bold]task.group[/bold]"
+        )
+        raise typer.Exit(1)
+
+    print_run_plan(cfg, tasks, console)
+
+    if dry_run:
+        console.print("[yellow]dry-run: stopping before executing ruflo[/yellow]")
+        raise typer.Exit(0)
 
     if eff.yolo:
         settings_path = ensure_bypass_permissions(cfg.base_dir)
@@ -631,9 +637,12 @@ def run_cmd(
     def _task_by_slot(slot: int) -> TaskEntry:
         return reg_entry.tasks[slot - 1]
 
-    def _spawn_one(idx: int, tname: str, tbody: str) -> None:
+    def _spawn_one(idx: int, tname: str, tbody: str, previous_tasks: list | None = None) -> None:
         te = _task_by_slot(idx)
-        objective = cfg.build_objective(task_body=tbody, task_name=tname)
+        objective = cfg.build_objective(
+            task_body=tbody, task_name=tname,
+            previous_tasks=previous_tasks, analysis=analysis,
+        )
         task_id = f"{base_task_id}-{tname}"
         runner.hooks_pre_task(task_id=task_id, description=tbody[:500])
         log_path = Path(te.log_path)
@@ -680,6 +689,50 @@ def run_cmd(
                 task_id=te.id, slot=te.slot, rc=task_rc,
             )
             registry.update(reg_entry)
+            if task_rc == 0 and cfg.task.on_task_complete.report:
+                run_report(
+                    cfg, runner, reg_entry, registry, eff, console,
+                    spec=cfg.task.on_task_complete,
+                    task_name=tname, source="task_report",
+                )
+
+    # Chain history: accumulated compressed snapshots of completed tasks.
+    # Only populated when task.chain is active (sequential multi-task).
+    chain_history: list = []
+
+    def _collect_chain(idx: int, tname: str, tbody: str, task_rc: int) -> None:
+        """After a task completes, compress and append to chain_history."""
+        if not cfg.task.chain:
+            return
+        item = cfg.task.group[idx - 1] if cfg.task.group and idx <= len(cfg.task.group) else None
+        item_chain = getattr(item, "chain", None) if item else None
+        if not resolve_chain_flag(cfg.task, item_chain):
+            return
+        report_path = None
+        if cfg.task.chain_include_report and cfg.task.on_task_complete.report:
+            rp = cfg.task.on_task_complete.report_path.replace("{task}", tname)
+            candidate = (cfg.base_dir / rp).resolve()
+            if candidate.exists():
+                report_path = candidate
+        chain_history.append(collect_chain_entry(
+            name=tname,
+            slot=idx,
+            total=len(tasks),
+            body=tbody,
+            report_path=report_path,
+            rc=task_rc,
+            max_tokens=cfg.task.chain_max_tokens,
+        ))
+
+    def _chain_for_task(idx: int) -> list | None:
+        """Return chain history to inject, or None if chaining disabled for this task."""
+        if not cfg.task.chain or not chain_history:
+            return None
+        item = cfg.task.group[idx - 1] if cfg.task.group and idx <= len(cfg.task.group) else None
+        item_chain = getattr(item, "chain", None) if item else None
+        if not resolve_chain_flag(cfg.task, item_chain):
+            return None
+        return chain_history
 
     try:
         if cfg.task.run_mode == "parallel" or not cfg.task.multi:
@@ -698,6 +751,11 @@ def run_cmd(
                     )
                     continue
                 console.print(f"\n[bold cyan]━ [{i}/{len(tasks)}] {tname}[/bold cyan]")
+                if chain_history:
+                    console.print(
+                        f"[dim]chain: injecting retrospective from "
+                        f"{len(chain_history)} previous task(s)[/dim]"
+                    )
                 pre_spawn_size = 0
                 if eff.background:
                     lp = _log_path_for(tname)
@@ -706,7 +764,7 @@ def run_cmd(
                             pre_spawn_size = lp.stat().st_size
                         except OSError:
                             pre_spawn_size = 0
-                _spawn_one(i, tname, tbody)
+                _spawn_one(i, tname, tbody, previous_tasks=_chain_for_task(i))
                 if eff.background:
                     te = reg_entry.tasks[i - 1]
                     console.print(f"[dim]waiting for {tname} to finish...[/dim]")
@@ -724,6 +782,17 @@ def run_cmd(
                         task_id=te.id, slot=te.slot, rc=task_rc,
                     )
                     registry.update(reg_entry)
+                    if task_rc == 0 and cfg.task.on_task_complete.report:
+                        run_report(
+                            cfg, runner, reg_entry, registry, eff, console,
+                            spec=cfg.task.on_task_complete,
+                            task_name=tname, source="task_report",
+                        )
+                    _collect_chain(i, tname, tbody, task_rc)
+                else:
+                    te = _task_by_slot(i)
+                    task_rc = te.rc if te.rc is not None else 0
+                    _collect_chain(i, tname, tbody, task_rc)
     except KeyboardInterrupt:
         # Docker-like: foreground run got Ctrl+C. Child claude -p procs share
         # our foreground process group so they've already received SIGINT from
@@ -748,8 +817,19 @@ def run_cmd(
             pass
         raise typer.Exit(130)
 
-    # In `-d` we are the detached grandchild here, so this runs after every
-    # spawned task has actually completed (sequential) or fired (parallel).
+    # Final report — runs after all tasks, before finalize.
+    if cfg.task.on_complete.report:
+        any_succeeded = any(
+            te.rc == 0 for te in reg_entry.tasks
+            if te.source not in ("task_report", "final_report")
+        )
+        if any_succeeded:
+            run_report(
+                cfg, runner, reg_entry, registry, eff, console,
+                spec=cfg.task.on_complete,
+                task_name="final", source="final_report",
+            )
+
     finalize_run(reg_entry, registry, base_task_id, console)
     if eff.background:
         # Daemon supervisor is done — exit cleanly without Typer postprocessing.
@@ -1065,11 +1145,12 @@ def follow_cmd(
 
     task_logs: list[tuple[str, Path]] | None = None
     task_defs = None
+    _report_sources = ("task_report", "final_report")
     if entry and entry.tasks:
         task_logs = [
             (te.name, Path(te.log_path))
             for te in entry.tasks
-            if te.log_path
+            if te.log_path and te.source not in _report_sources
         ]
         from .follow import TaskSeed
         task_defs = [
@@ -1081,6 +1162,7 @@ def follow_cmd(
                 rc=te.rc,
             )
             for te in entry.tasks
+            if te.source not in _report_sources
         ]
 
     n_logs = len(task_logs) if task_logs else 1
@@ -1473,7 +1555,9 @@ def ps_cmd(
 
         created = fmt_age(e.started_at)
         tok = fmt_tokens(e.total_tokens) if e.total_tokens else "-"
-        task_count = str(len(e.tasks)) if e.tasks else "-"
+        real_tasks = [t for t in e.tasks
+                      if t.source not in ("task_report", "final_report")]
+        task_count = str(len(real_tasks)) if real_tasks else "-"
         base = e.base_dir
         if not Path(base).exists():
             base = f"[dim strike]{base}[/dim strike]"
@@ -1604,6 +1688,116 @@ def projects_cmd():
     )
 
 
+def _tasks_delete(
+    reg: Registry,
+    id_or_task: Optional[str],
+    *,
+    rm_all: bool,
+    rm_files: bool,
+    config: Path,
+) -> None:
+    """Implement --rm / --rm-all for `rufler tasks`."""
+
+    def _delete_files(entry: RunEntry, task_entries: list[TaskEntry]) -> int:
+        """Delete on-disk task files and logs. Returns count of files removed."""
+        removed = 0
+        for te in task_entries:
+            # Task file (.rufler/tasks/task_N.md)
+            if te.file_path:
+                fp = Path(te.file_path)
+                if fp.exists():
+                    fp.unlink()
+                    removed += 1
+            # Log file
+            if te.log_path:
+                lp = Path(te.log_path)
+                if lp.exists():
+                    lp.unlink()
+                    removed += 1
+        return removed
+
+    if rm_all:
+        # Remove all tasks across all runs in cwd.
+        cwd_resolved = Path.cwd().resolve()
+        all_entries = reg.list_refreshed(include_all=True)
+        candidates = [
+            e for e in all_entries
+            if Path(e.base_dir).resolve() == cwd_resolved
+        ]
+        if not candidates:
+            console.print("[yellow]no runs found for this directory[/yellow]")
+            raise typer.Exit(0)
+        total_removed = 0
+        files_removed = 0
+        for entry in candidates:
+            if rm_files:
+                files_removed += _delete_files(entry, entry.tasks)
+            n = reg.remove_tasks(entry.id)
+            total_removed += n
+        console.print(
+            f"[green]removed {total_removed} task(s)[/green] "
+            f"from {len(candidates)} run(s)"
+        )
+        if files_removed:
+            console.print(f"[dim]deleted {files_removed} file(s) from disk[/dim]")
+        return
+
+    if not id_or_task:
+        console.print("[red]pass a task sub-id or run id with --rm[/red]")
+        raise typer.Exit(1)
+
+    # Single task (a1b2c3d4.01) or all tasks in a run (a1b2c3d4).
+    if "." in id_or_task:
+        # Specific task sub-id.
+        run_prefix = id_or_task.split(".")[0]
+        matches = reg.find_ambiguous(run_prefix)
+        if not matches:
+            console.print(f"[red]no run matching[/red] [bold]{run_prefix}[/bold]")
+            raise typer.Exit(1)
+        if len(matches) > 1:
+            console.print(
+                f"[red]ambiguous prefix[/red] [bold]{run_prefix}[/bold] — "
+                f"{len(matches)} matches"
+            )
+            raise typer.Exit(1)
+        entry = matches[0]
+        targets = [te for te in entry.tasks if te.id == id_or_task]
+        if not targets:
+            console.print(f"[red]task not found:[/red] [bold]{id_or_task}[/bold]")
+            raise typer.Exit(1)
+        if rm_files:
+            n_files = _delete_files(entry, targets)
+            if n_files:
+                console.print(f"[dim]deleted {n_files} file(s) from disk[/dim]")
+        removed = reg.remove_tasks(entry.id, [id_or_task])
+        console.print(
+            f"[green]removed[/green] [cyan]{id_or_task}[/cyan] "
+            f"({targets[0].name}) from run {entry.id}"
+        )
+    else:
+        # Run id — remove all tasks in that run.
+        matches = reg.find_ambiguous(id_or_task)
+        if not matches:
+            console.print(f"[red]no run matching[/red] [bold]{id_or_task}[/bold]")
+            raise typer.Exit(1)
+        if len(matches) > 1:
+            console.print(
+                f"[red]ambiguous prefix[/red] [bold]{id_or_task}[/bold] — "
+                f"{len(matches)} matches"
+            )
+            raise typer.Exit(1)
+        entry = matches[0]
+        if rm_files:
+            n_files = _delete_files(entry, entry.tasks)
+            if n_files:
+                console.print(f"[dim]deleted {n_files} file(s) from disk[/dim]")
+        removed = reg.remove_tasks(entry.id)
+        console.print(
+            f"[green]removed {removed} task(s)[/green] from run "
+            f"[cyan]{entry.id}[/cyan] ({entry.project})"
+        )
+
+
 @app.command("tasks")
 def tasks_cmd(
     id_or_task: Optional[str] = typer.Argument(
@@ -1625,6 +1819,21 @@ def tasks_cmd(
     verbose: bool = typer.Option(
         False, "--verbose", "-v", help="Show detailed card for a single task"
     ),
+    rm: bool = typer.Option(
+        False, "--rm",
+        help="Delete the task(s) identified by [ID] from the registry. "
+             "Pass a task sub-id (a1b2c3d4.01) to remove one task, "
+             "or a run id to remove ALL tasks in that run.",
+    ),
+    rm_all: bool = typer.Option(
+        False, "--rm-all",
+        help="Remove ALL tasks across all runs for the current project directory.",
+    ),
+    rm_files: bool = typer.Option(
+        False, "--rm-files",
+        help="When used with --rm or --rm-all, also delete the on-disk task "
+             "files (.rufler/tasks/*.md) and logs.",
+    ),
 ):
     """List tasks for a rufler run with status, tokens, and timing.
 
@@ -1632,8 +1841,22 @@ def tasks_cmd(
     By default shows the latest run's tasks for the current directory.
     Pass a run id prefix to inspect a specific run, or a full task sub-id
     (e.g. a1b2c3d4.01) plus -v for a detailed card.
+
+    \b
+    Delete tasks:
+      rufler tasks a1b2c3d4.01 --rm          # remove one task from registry
+      rufler tasks a1b2c3d4 --rm              # remove all tasks in that run
+      rufler tasks --rm-all                   # remove all tasks in current project
+      rufler tasks --rm-all --rm-files        # also delete .rufler/tasks/*.md + logs
     """
     reg = Registry()
+
+    # ---- Delete mode ----
+    if rm or rm_all:
+        _tasks_delete(
+            reg, id_or_task, rm_all=rm_all, rm_files=rm_files, config=config,
+        )
+        return
 
     target_task_id: Optional[str] = None
     run_id_prefix: Optional[str] = None
@@ -1684,11 +1907,13 @@ def tasks_cmd(
         console.print(f"[red]task not found:[/red] [bold]{target_task_id}[/bold]")
         raise typer.Exit(1)
 
-    # Table view.
+    # Table view — report tasks are hidden by default.
     all_rows: list[tuple[RunEntry, TaskEntry, str, int]] = []
     for entry in entries:
         resolved = resolve_tasks_for_entry(entry)
         for te, st, tok in resolved:
+            if te.source in ("task_report", "final_report"):
+                continue
             if status_filter and st != status_filter:
                 continue
             all_rows.append((entry, te, st, tok))

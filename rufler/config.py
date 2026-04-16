@@ -62,10 +62,33 @@ def _parse_task(raw: dict) -> "TaskSpec":
             f"task.group must be dict or list, got {type(group_raw).__name__}"
         )
 
-    allowed = set(TaskSpec.__dataclass_fields__)
+    # Extract report specs before passing remaining keys to TaskSpec.
+    on_task_raw = raw.pop("on_task_complete", None)
+    on_complete_raw = raw.pop("on_complete", None)
+
+    allowed = set(TaskSpec.__dataclass_fields__) - {"on_task_complete", "on_complete"}
     kwargs = {k: v for k, v in raw.items() if k in allowed and k != "group"}
     spec = TaskSpec(**kwargs)
     spec.group = group
+
+    if isinstance(on_task_raw, dict):
+        report_fields = set(ReportSpec.__dataclass_fields__)
+        filtered = {k: v for k, v in on_task_raw.items() if k in report_fields}
+        spec.on_task_complete = ReportSpec(**filtered)
+        if not spec.on_task_complete.report_path:
+            spec.on_task_complete.report_path = ".rufler/reports/{task}.md"
+    elif on_task_raw is False:
+        spec.on_task_complete = ReportSpec(report=False)
+
+    if isinstance(on_complete_raw, dict):
+        report_fields = set(ReportSpec.__dataclass_fields__)
+        filtered = {k: v for k, v in on_complete_raw.items() if k in report_fields}
+        spec.on_complete = ReportSpec(**filtered)
+        if not spec.on_complete.report_path:
+            spec.on_complete.report_path = ".rufler/report.md"
+    elif on_complete_raw is False:
+        spec.on_complete = ReportSpec(report=False)
+
     if spec.run_mode not in VALID_RUN_MODES:
         raise ValueError(
             f"task.run_mode '{spec.run_mode}' invalid — must be one of {sorted(VALID_RUN_MODES)}"
@@ -418,6 +441,7 @@ class TaskItem:
     name: str
     file_path: Optional[str] = None
     content: Optional[str] = None  # inline alternative to file_path
+    chain: Optional[bool] = None   # per-task override (None = inherit from TaskSpec)
 
     def resolved(self, base: Path) -> str:
         if self.content and self.content.strip():
@@ -430,6 +454,15 @@ class TaskItem:
                 )
             return p.read_text(encoding="utf-8").strip()
         raise ValueError(f"task '{self.name}': needs file_path or content")
+
+
+@dataclass
+class ReportSpec:
+    """Report generation settings — shared shape for per-task and final reports."""
+    report: bool = True
+    report_path: str = ""
+    report_prompt: Optional[str] = None
+    report_prompt_path: Optional[str] = None
 
 
 @dataclass
@@ -449,7 +482,33 @@ class TaskSpec:
     decompose_file: str = ".rufler/tasks/decomposed_tasks.yml"
     decompose_prompt: Optional[str] = None       # inline override for decomposer prompt
     decompose_prompt_path: Optional[str] = None  # md file override for decomposer prompt
+    decompose_model: str = "sonnet"              # model for decompose phase
+    decompose_effort: str = "high"               # thinking effort for decompose: low | medium | high | max
+
+    # Deep Think — project analysis before decompose / execute
+    deep_think: bool = False
+    deep_think_model: str = "opus"               # model for deep analysis (opus recommended)
+    deep_think_output: str = ".rufler/analysis.md"
+    deep_think_prompt: Optional[str] = None      # inline override for analysis prompt
+    deep_think_prompt_path: Optional[str] = None # md file override
+    deep_think_timeout: int = 600                # seconds
+    deep_think_budget: Optional[float] = None    # max budget in $ (--max-budget-usd)
+    deep_think_effort: str = "max"               # thinking effort: low | medium | high | max
+    deep_think_allowed_tools: Optional[str] = None  # override --allowedTools; default "Read,Glob,Grep,Bash"
     group: list[TaskItem] = field(default_factory=list)
+
+    # Task chaining — pass compressed retrospective of previous tasks into
+    # the next task's prompt so each new claude -p session has context.
+    chain: bool = False
+    chain_max_tokens: int = 2000
+    chain_include_report: bool = True
+
+    on_task_complete: ReportSpec = field(
+        default_factory=lambda: ReportSpec(report_path=".rufler/reports/{task}.md")
+    )
+    on_complete: ReportSpec = field(
+        default_factory=lambda: ReportSpec(report_path=".rufler/report.md")
+    )
 
     def resolved_main(self, base: Path) -> str:
         if self.main and self.main.strip():
@@ -646,12 +705,31 @@ class FlowConfig:
         for n in graph:
             visit(n, [])
 
-    def build_objective(self, task_body: Optional[str] = None, task_name: str = "main") -> str:
+    def build_objective(
+        self,
+        task_body: Optional[str] = None,
+        task_name: str = "main",
+        previous_tasks: Optional[list] = None,
+        analysis: Optional[str] = None,
+    ) -> str:
+        from .tasks.chain import build_retrospective
+
         lines: list[str] = []
         lines.append(f"# PROJECT: {self.project.name}")
         if self.project.description:
             lines.append(self.project.description.strip())
         lines.append("")
+
+        if analysis:
+            lines.append("# PROJECT ANALYSIS (from deep_think phase — read-only context)")
+            lines.append(analysis.strip())
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+        if previous_tasks:
+            lines.append(build_retrospective(previous_tasks))
+
         body = task_body if task_body is not None else self.task.resolved_main(self.base_dir)
         header = "MAIN TASK" if task_name == "main" else f"TASK: {task_name}"
         lines.append(f"# {header}")

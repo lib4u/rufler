@@ -861,6 +861,50 @@ def test_task_entry_roundtrip_in_registry(tmp_path: Path):
     assert t2.started_at is None
 
 
+def test_remove_tasks_specific(tmp_path: Path):
+    """remove_tasks with explicit task_ids removes only those tasks."""
+    reg = Registry(path=tmp_path / "r.json")
+    e = new_entry(
+        project="rt-del", flow_file=tmp_path / "f.yml", base_dir=tmp_path,
+        mode="foreground", run_mode="sequential", log_path=tmp_path / "x.log",
+    )
+    e.tasks = [
+        TaskEntry(name="t1", log_path="t1.log", id=f"{e.id}.01", slot=1),
+        TaskEntry(name="t2", log_path="t2.log", id=f"{e.id}.02", slot=2),
+        TaskEntry(name="t3", log_path="t3.log", id=f"{e.id}.03", slot=3),
+    ]
+    reg.add(e)
+    removed = reg.remove_tasks(e.id, [f"{e.id}.02"])
+    assert removed == 1
+    loaded = reg.list_all()[0]
+    assert len(loaded.tasks) == 2
+    assert [t.name for t in loaded.tasks] == ["t1", "t3"]
+
+
+def test_remove_tasks_all(tmp_path: Path):
+    """remove_tasks with task_ids=None removes ALL tasks from the entry."""
+    reg = Registry(path=tmp_path / "r.json")
+    e = new_entry(
+        project="rt-all", flow_file=tmp_path / "f.yml", base_dir=tmp_path,
+        mode="foreground", run_mode="sequential", log_path=tmp_path / "x.log",
+    )
+    e.tasks = [
+        TaskEntry(name="t1", log_path="t1.log", id=f"{e.id}.01", slot=1),
+        TaskEntry(name="t2", log_path="t2.log", id=f"{e.id}.02", slot=2),
+    ]
+    reg.add(e)
+    removed = reg.remove_tasks(e.id)
+    assert removed == 2
+    loaded = reg.list_all()[0]
+    assert loaded.tasks == []
+
+
+def test_remove_tasks_nonexistent_run(tmp_path: Path):
+    """remove_tasks on a missing run returns 0."""
+    reg = Registry(path=tmp_path / "r.json")
+    assert reg.remove_tasks("nonexistent") == 0
+
+
 # ---------- rufler tasks CLI integration ----------
 
 def _patch_registry(monkeypatch, reg: Registry):
@@ -1265,3 +1309,89 @@ def test_mcp_no_section_defaults_empty(tmp_path: Path):
     )
     cfg = FlowConfig.load(p)
     assert cfg.mcp.servers == []
+
+
+# ---------- report config parsing ----------
+
+def test_report_defaults_enabled(tmp_path: Path):
+    from rufler.config import FlowConfig
+    p = tmp_path / "rufler_flow.yml"
+    p.write_text(
+        "project:\n  name: rpt\ntask:\n  main: x\n"
+        "agents:\n  - {name: a, type: coder, role: worker, seniority: junior, prompt: p}\n",
+        encoding="utf-8",
+    )
+    cfg = FlowConfig.load(p)
+    assert cfg.task.on_task_complete.report is True
+    assert cfg.task.on_complete.report is True
+    assert cfg.task.on_task_complete.report_path == ".rufler/reports/{task}.md"
+    assert cfg.task.on_complete.report_path == ".rufler/report.md"
+
+
+def test_report_custom_prompt(tmp_path: Path):
+    from rufler.config import FlowConfig
+    p = tmp_path / "rufler_flow.yml"
+    p.write_text(
+        "project:\n  name: rpt\ntask:\n  main: x\n"
+        "  on_complete:\n"
+        "    report: true\n"
+        "    report_prompt: 'Custom final summary.'\n"
+        "agents:\n  - {name: a, type: coder, role: worker, seniority: junior, prompt: p}\n",
+        encoding="utf-8",
+    )
+    cfg = FlowConfig.load(p)
+    assert cfg.task.on_complete.report_prompt == "Custom final summary."
+    assert cfg.task.on_complete.report is True
+
+
+def test_report_disabled(tmp_path: Path):
+    from rufler.config import FlowConfig
+    p = tmp_path / "rufler_flow.yml"
+    p.write_text(
+        "project:\n  name: rpt\ntask:\n  main: x\n"
+        "  on_task_complete:\n    report: false\n"
+        "  on_complete: false\n"
+        "agents:\n  - {name: a, type: coder, role: worker, seniority: junior, prompt: p}\n",
+        encoding="utf-8",
+    )
+    cfg = FlowConfig.load(p)
+    assert cfg.task.on_task_complete.report is False
+    assert cfg.task.on_complete.report is False
+
+
+def test_report_custom_path(tmp_path: Path):
+    from rufler.config import FlowConfig
+    p = tmp_path / "rufler_flow.yml"
+    p.write_text(
+        "project:\n  name: rpt\ntask:\n  main: x\n"
+        "  on_task_complete:\n    report_path: docs/reports/{task}.md\n"
+        "  on_complete:\n    report_path: docs/FINAL.md\n"
+        "agents:\n  - {name: a, type: coder, role: worker, seniority: junior, prompt: p}\n",
+        encoding="utf-8",
+    )
+    cfg = FlowConfig.load(p)
+    assert cfg.task.on_task_complete.report_path == "docs/reports/{task}.md"
+    assert cfg.task.on_complete.report_path == "docs/FINAL.md"
+
+
+def test_report_prompt_resolution():
+    from rufler.config import ReportSpec
+    from rufler.tasks.report import _resolve_prompt
+    from pathlib import Path
+
+    spec = ReportSpec(report_prompt="Custom: {project} done.")
+    result = _resolve_prompt(
+        spec, Path("/tmp"), is_final=True,
+        task_name="final", project="myapp", ns="default",
+        report_path=".rufler/report.md",
+    )
+    assert result == "Custom: myapp done."
+
+    spec_default = ReportSpec()
+    result_default = _resolve_prompt(
+        spec_default, Path("/tmp"), is_final=True,
+        task_name="final", project="myapp", ns="default",
+        report_path=".rufler/report.md",
+    )
+    assert "myapp" in result_default
+    assert "report" in result_default.lower()

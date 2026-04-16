@@ -156,8 +156,12 @@ class TuiState:
                 if self.status == "starting":
                     self.status = "running"
             elif "log ended" in text:
-                # In multi-task mode each task has its own "log ended".
-                # Only mark the whole run done when no tasks remain.
+                # Mark active task done when its log ends.
+                if self.active_task:
+                    ti = self._task_by_name(self.active_task)
+                    if ti and ti.status == "running":
+                        ti.status = "done" if "rc=0" in text else "failed"
+                        ti.finished_at = ti.finished_at or ts
                 has_remaining = any(
                     ti.status in ("queued", "running")
                     for ti in self.task_list
@@ -301,9 +305,12 @@ class TuiState:
                 self._push_event(
                     ts, "ok" if ok else "error",
                     f"RESULT {sym} {result_text}")
-                # In multi-task mode, a `result` event ends one claude
-                # session (one task), not the entire run. Only set
-                # status=done when there are no more tasks to run.
+                # Mark the active task as done/failed.
+                if self.active_task:
+                    ti = self._task_by_name(self.active_task)
+                    if ti and ti.status == "running":
+                        ti.status = "done" if ok else "failed"
+                        ti.finished_at = ti.finished_at or ts
                 has_remaining = any(
                     ti.status in ("queued", "running")
                     for ti in self.task_list

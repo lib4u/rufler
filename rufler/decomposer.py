@@ -89,6 +89,7 @@ def decompose(
     yml_path: Path,
     *,
     model: str = "sonnet",
+    effort: str = "high",
     prompt_template: Optional[str] = None,
 ) -> list[dict]:
     """Call claude -p, parse YAML, write subtask files + companion yml.
@@ -108,6 +109,8 @@ def decompose(
         "-p",
         "--model",
         model,
+        "--effort",
+        effort,
         "--output-format",
         "text",
         "--dangerously-skip-permissions",

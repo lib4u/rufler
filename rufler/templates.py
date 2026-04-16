@@ -30,6 +30,21 @@ task:
   max_iterations: 100       # autopilot: max re-engagement iterations (1-1000)
   timeout_minutes: 180      # autopilot: total timeout in minutes (1-1440)
 
+  # Report after each individual task completes (multi-task mode):
+  # on_task_complete:
+  #   report: true                            # default: true
+  #   report_path: .rufler/reports/{task}.md   # {task} replaced with task name
+  #   report_prompt: |                        # optional custom prompt
+  #     Summarize what this task accomplished.
+
+  # Report after ALL tasks complete:
+  # on_complete:
+  #   report: true                            # default: true
+  #   report_path: .rufler/report.md
+  #   report_prompt: |                        # optional custom prompt
+  #     Write a final project summary.
+  #   # report_prompt_path: ./prompts/final-report.md  # OR load from file
+
 # How to launch Claude Code — set once here, `rufler start` honors it.
 # CLI flags (--background / --yolo / --non-interactive) override these.
 execution:

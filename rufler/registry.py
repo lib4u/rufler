@@ -498,6 +498,31 @@ class Registry:
                 self._save_raw(new_items)
             return removed
 
+    def remove_tasks(self, entry_id: str, task_ids: Optional[list[str]] = None) -> int:
+        """Remove specific tasks from a run entry, or ALL tasks if *task_ids* is None.
+
+        Returns the number of tasks removed.  Does NOT delete on-disk task
+        files or logs — only the registry bookkeeping.
+        """
+        with self._locked():
+            items = self._load_raw()
+            for d in items:
+                if d.get("id") != entry_id:
+                    continue
+                tasks_raw = d.get("tasks") or []
+                if task_ids is None:
+                    d["tasks"] = []
+                    self._save_raw(items)
+                    return len(tasks_raw)
+                ids_set = set(task_ids)
+                new_tasks = [t for t in tasks_raw if t.get("id") not in ids_set]
+                removed = len(tasks_raw) - len(new_tasks)
+                if removed:
+                    d["tasks"] = new_tasks
+                    self._save_raw(items)
+                return removed
+        return 0
+
     # ---- CLI-friendly state-transition helpers (T19) ----
 
     def attach_pid(

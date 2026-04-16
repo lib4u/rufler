@@ -58,11 +58,92 @@ def resolve_exec_overrides(
     )
 
 
+def run_deep_think(
+    cfg: FlowConfig,
+    console: Console,
+    *,
+    force_new: bool = False,
+) -> str | None:
+    """Run the Deep Think phase — analyze the project before decompose/execute.
+
+    Returns the analysis text, or None if deep_think is disabled.
+    Caches the result to ``cfg.task.deep_think_output``; reuses on re-run
+    unless *force_new* is True.
+    """
+    if not cfg.task.deep_think:
+        return None
+
+    output_path = (cfg.base_dir / cfg.task.deep_think_output).resolve()
+
+    if not force_new and output_path.exists():
+        console.rule("[bold]0a. deep think (reusing existing)[/bold]")
+        analysis = output_path.read_text(encoding="utf-8").strip()
+        console.print(f"[dim]loaded analysis from {output_path}[/dim]")
+        console.print(f"[dim]use [bold]--new[/bold] to regenerate[/dim]")
+        return analysis
+
+    try:
+        main_body = cfg.task.resolved_main(cfg.base_dir)
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    if not main_body:
+        console.print("[red]deep_think: task.main (or main_path) is required[/red]")
+        raise typer.Exit(1)
+
+    prompt_template: str | None = None
+    if cfg.task.deep_think_prompt:
+        prompt_template = cfg.task.deep_think_prompt
+    elif cfg.task.deep_think_prompt_path:
+        pt_path = (cfg.base_dir / cfg.task.deep_think_prompt_path).expanduser().resolve()
+        if not pt_path.exists():
+            console.print(f"[red]task.deep_think_prompt_path not found:[/red] {pt_path}")
+            raise typer.Exit(1)
+        prompt_template = pt_path.read_text(encoding="utf-8")
+    if prompt_template:
+        console.print("[dim]using custom deep_think prompt from yml[/dim]")
+
+    console.rule(
+        f"[bold]0a. deep think → {cfg.task.deep_think_output}[/bold]"
+    )
+    console.print(
+        f"[dim]claude -p --model {cfg.task.deep_think_model} "
+        f"(read-only analysis, timeout={cfg.task.deep_think_timeout}s)[/dim]"
+    )
+
+    from .tasks.deep_think import deep_think
+
+    extra_kw: dict = {}
+    if cfg.task.deep_think_allowed_tools is not None:
+        extra_kw["allowed_tools"] = cfg.task.deep_think_allowed_tools
+
+    try:
+        analysis = deep_think(
+            main_body,
+            output_path,
+            model=cfg.task.deep_think_model,
+            effort=cfg.task.deep_think_effort,
+            prompt_template=prompt_template,
+            timeout=cfg.task.deep_think_timeout,
+            budget=cfg.task.deep_think_budget,
+            **extra_kw,
+        )
+    except Exception as e:
+        console.print(f"[red]deep_think failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    lines = analysis.splitlines()
+    preview = lines[0][:120] if lines else "(empty)"
+    console.print(f"[green]analysis written[/green] ({len(lines)} lines) — {preview}")
+    return analysis
+
+
 def decompose_task_group(
     cfg: FlowConfig,
     console: Console,
     *,
     force_new: bool = False,
+    analysis: str | None = None,
 ) -> None:
     """Decompose `task.main` into `task.decompose_count` subtasks via a
     claude-powered decomposer, then mutate `cfg.task.group` in place.
@@ -75,6 +156,9 @@ def decompose_task_group(
     decompose already exists on disk, the existing task files are reused
     instead of calling claude again. Pass `force_new=True` (via
     `rufler run --new`) to regenerate from scratch.
+
+    If *analysis* is provided (from deep_think), it is prepended to the
+    main task body so the decomposer sees the project context.
     """
     if not (cfg.task.multi and cfg.task.decompose and not cfg.task.group):
         return
@@ -122,11 +206,18 @@ def decompose_task_group(
         )
         raise typer.Exit(1)
 
+    if analysis:
+        main_body = (
+            f"## PROJECT ANALYSIS (from deep_think phase)\n\n{analysis}\n\n"
+            f"---\n\n## ORIGINAL TASK\n\n{main_body}"
+        )
+        console.print("[dim]injecting deep_think analysis into decomposer context[/dim]")
+
     out_dir = (cfg.base_dir / cfg.task.decompose_dir).resolve()
     console.rule(
-        f"[bold]0. decompose main → {cfg.task.decompose_count} subtasks[/bold]"
+        f"[bold]0b. decompose main → {cfg.task.decompose_count} subtasks[/bold]"
     )
-    console.print(f"[dim]claude -p decomposer → {yml_out}[/dim]")
+    console.print(f"[dim]claude -p --model {cfg.task.decompose_model} decomposer → {yml_out}[/dim]")
 
     prompt_template: Optional[str] = None
     if cfg.task.decompose_prompt:
@@ -149,6 +240,8 @@ def decompose_task_group(
             cfg.task.decompose_count,
             out_dir,
             yml_out,
+            model=cfg.task.decompose_model,
+            effort=cfg.task.decompose_effort,
             prompt_template=prompt_template,
         )
     except Exception as e:

@@ -54,6 +54,8 @@ In short: `ruflo` is the engine, `rufler` is the ignition + dashboard + cruise c
 - **Soft resume via memory** — the composed objective tells agents to probe the shared memory namespace for prior progress before restarting work, so an interrupted run can pick up where it left off.
 - **Mono, multi and decomposed tasks** — run one big task, an explicit list of subtasks, or let Claude decompose `main` into N subtasks.
 - **Sequential and parallel run modes** for multi-task groups.
+- **Task chaining** (`task.chain: true`) — in sequential multi-task mode, each new `claude -p` session receives a compressed retrospective of all previous tasks (body + report), so it has full context without sharing a session. Per-task override with `chain: false` on individual group items.
+- **Deep Think** (`task.deep_think: true`) — before decomposing or executing, rufler spawns a read-only `claude -p` session (configurable model, default opus) that scans the project structure, reads key files, and writes a structured analysis to `.rufler/analysis.md`. The analysis is injected into the decomposer and/or the agent objective so every downstream step has project-aware context. Cached on re-run; `--new` forces rescan.
 - **Detached background mode** with a proper supervisor process and NDJSON logs.
 - **Live dashboard** via `rufler follow` — 4-panel TUI with task list, session stats, AI conversation stream (thinking, text, tool calls), and system events. Tails all per-task logs in multi-task mode.
 - **Custom decomposer prompt** — override the task-splitter prompt inline or from an `.md` file.
@@ -61,6 +63,7 @@ In short: `ruflo` is the engine, `rufler` is the ignition + dashboard + cruise c
 - **External prompts** — agents and tasks can be inline OR loaded from `.md` files, so prompts stay out of YAML.
 - **[skills.sh](https://skills.sh) integration** — pull third-party Claude Code skills straight from the yml. Drop a repo URL, an `owner/repo` shorthand, or paste a full `skills add …` command into `skills.custom`; rufler shells out to `npx skills add` pre-run, verifies each `SKILL.md` landed, and reports results in the plan banner. Mix-and-match with local paths and ruflo's built-in packs in the same list.
 - **MCP server management** — declare MCP servers in `mcp.servers` and rufler registers them with Claude Code via `claude mcp add` during init. Supports stdio, http, and sse transports with env vars and headers. `rufler mcp` inspects what's declared vs registered.
+- **Automatic reports** — after each task (`on_task_complete`) and after all tasks (`on_complete`), rufler spawns a short claude session to write a markdown report. Enabled by default; custom prompts supported inline or from `.md` files.
 - **Graceful shutdown** — `rufler stop` ends the session cleanly and writes post-task hooks.
 
 ---
@@ -137,7 +140,7 @@ rufler stop
 | `rufler skills` | Inspect installed skills in `<project>/.claude/skills/` and show the yml snapshot. `--available` lists packs/skills in ruflo's bundled source tree. `--delete` wipes non-symlinked skill dirs from the project (with confirmation; `-y` to skip). |
 | `rufler mcp` | List MCP servers declared in `rufler_flow.yml`. `--active` shows what's actually registered in `~/.claude.json` for this project. Servers are added via `claude mcp add` during `rufler run`/`build`. |
 | `rufler ps [ID]` | Docker-style list of runs. No args → running only. `-a` → all. `--prune` / `--prune-older-than-days N` → clean stale entries. With an ID → detailed view of one run (status, tasks, claude procs, log tail). |
-| `rufler tasks [ID]` | List tasks for a run with sub-ids, status, tokens, timing. Without id → latest run in cwd. `-a` → all runs. `--status running` → filter. Pass a task sub-id (e.g. `a1b2c3d4.01 -v`) for a detailed card with token breakdown and recent log events. |
+| `rufler tasks [ID]` | List tasks for a run with sub-ids, status, tokens, timing. Without id → latest run in cwd. `-a` → all runs. `--status running` → filter. Pass a task sub-id (e.g. `a1b2c3d4.01 -v`) for a detailed card with token breakdown and recent log events. `--rm` removes tasks from the registry; `--rm-all` removes all tasks in cwd; `--rm-files` also deletes task files and logs from disk. |
 | `rufler projects` | Per-project rollup: last run id, when it last ran, total runs. Survives `rufler rm` and pruning. |
 | `rufler logs [ID]` | Tail recent autopilot events. `--raw` prints the NDJSON log directly. `-f` / `--follow` streams new lines live. Pass a task sub-id (e.g. `a1b2c3d4.01`) to see only that task's log slice. |
 | `rufler follow [ID]` | Live TUI dashboard: task progress (with status icons), AI conversation stream (thinking, text, tool calls), session stats, and system events. Tails all per-task logs automatically. |
@@ -249,6 +252,40 @@ task:
     You split tasks. Placeholders: {n} and {main}.
     Output YAML: tasks: [ {name, title, content} ]
   decompose_prompt_path: ./prompts/decompose.md   # OR load decomposer prompt from file
+  decompose_model: sonnet             # model for the decompose call (default sonnet)
+  decompose_effort: high             # thinking effort for decomposer (low/medium/high/max)
+
+  # --- deep think (project analysis before decompose/execute) ---
+  deep_think: false                   # true → read-only claude session scans the project first
+  deep_think_model: opus              # model for analysis (opus recommended for deep reasoning)
+  deep_think_effort: max             # thinking effort for deep think (low/medium/high/max; default max)
+  deep_think_output: .rufler/analysis.md  # cached; reused on re-run, --new to regenerate
+  deep_think_timeout: 600             # seconds
+  deep_think_budget: 1.50            # optional max spend in USD for the deep think session
+  deep_think_allowed_tools: "Read,Glob,Grep,Bash"  # restrict --allowedTools (default: not set → ALL tools including MCP)
+  deep_think_prompt: |                # optional inline override
+    Analyze this project for: {main}
+  deep_think_prompt_path: ./prompts/analyze.md    # OR load from file
+
+  # --- task chaining (sequential multi-task only) ---
+  chain: false                        # true → inject compressed retrospective of previous tasks into the next task's prompt
+  chain_max_tokens: 2000              # word budget for the compressed retrospective (body + report combined)
+  chain_include_report: true          # include the per-task report in the retrospective (requires on_task_complete.report)
+
+  # --- reports (two levels) ---
+  on_task_complete:                     # after EACH task completes
+    report: true                        # default: enabled
+    report_path: .rufler/reports/{task}.md  # {task} replaced with task name
+    # report_prompt: |                  # optional custom prompt
+    #   Summarize what this task accomplished.
+    # report_prompt_path: ./prompts/task-report.md
+
+  on_complete:                          # after ALL tasks complete
+    report: true                        # default: enabled
+    report_path: .rufler/report.md
+    # report_prompt: |                  # optional custom prompt
+    #   Write a final project completion report.
+    # report_prompt_path: ./prompts/final-report.md
 
 execution:
   non_interactive: false
@@ -291,6 +328,11 @@ agents:
     seniority: senior
     prompt: Implement the design.
     depends_on: [architect]           # soft DAG — see "Agent dependencies" below
+
+# Per-task chain override (inside group items):
+#   - name: review
+#     file_path: tasks/review.md
+#     chain: false                    # this task does NOT receive the retrospective (overrides task.chain)
 ```
 
 ### Validation rules
@@ -383,6 +425,113 @@ You can override the decomposer prompt inline (`decompose_prompt`) or from a fil
 
 Rule of thumb: **write `group` when the split is part of your spec; use `decompose` when the split itself is the question you're asking Claude.**
 
+### Deep Think (project analysis)
+
+By default, `decompose: true` splits a task "blindly" — the decomposer LLM doesn't see the project's actual files, structure, or existing code. This leads to subtasks that may duplicate existing work, target wrong files, or miss dependencies.
+
+**`task.deep_think: true`** fixes this by adding a read-only analysis phase before everything else:
+
+```
+0a. deep think   → claude -p --model opus (Read, Glob, Grep, Bash only) → .rufler/analysis.md
+0b. decompose    → claude -p --model sonnet (analysis injected as context) → subtasks
+1-N. execute     → hive spawn (analysis injected into every objective)
+```
+
+```yaml
+task:
+  main: "Add /users CRUD endpoint to the REST API"
+  deep_think: true
+  deep_think_model: opus         # deep reasoning model (default opus)
+  deep_think_effort: max         # thinking effort (low/medium/high/max)
+  deep_think_budget: 1.50       # optional max spend in USD
+  decompose: true
+  decompose_count: 4
+  decompose_effort: high        # thinking effort for the decomposer
+```
+
+The analysis agent scans the project and writes a structured report:
+
+1. **Project Overview** — language, framework, dependencies
+2. **Directory Structure** — layout with descriptions
+3. **Existing Implementation** — what's already built (with file paths)
+4. **Gaps & Missing Pieces** — what's NOT implemented relative to the task
+5. **Dependencies & Impact** — which files will be affected, risk areas
+6. **Recommended Approach** — step-by-step plan informed by the analysis
+
+This report is then:
+- **Injected into the decomposer prompt** (when `decompose: true`) — so subtasks are project-aware
+- **Injected into every agent objective** — so agents don't waste time re-discovering what exists
+
+**Caching.** The analysis is saved to `deep_think_output` (default `.rufler/analysis.md`). On re-run, the cached file is reused. Pass `--new` to force a fresh scan.
+
+**Model selection.** Use `deep_think_model` to pick the model for analysis — both aliases (`opus`, `sonnet`) and full model IDs (`claude-opus-4-6`) are accepted. Opus is recommended for thorough reasoning; Sonnet is faster and cheaper for simpler projects.
+
+**Effort & budget.** `deep_think_effort` controls reasoning depth (`low`/`medium`/`high`/`max`; default `max`). `deep_think_budget` sets an optional USD spending cap for the analysis session. Similarly, `decompose_effort` controls the decomposer's reasoning depth (default `high`).
+
+**MCP access.** By default deep think has access to **all tools** — file tools, Bash, and every registered MCP server. To restrict the session to specific tools only, set `deep_think_allowed_tools`:
+
+```yaml
+task:
+  deep_think: true
+  deep_think_allowed_tools: "Read,Glob,Grep,Bash"  # lock down to read-only file tools
+```
+
+When set, this passes `--allowedTools` to `claude -p`, limiting the session to the listed tools. When omitted (default), no restriction is applied — deep think can use everything available, including MCP.
+
+**Without decompose.** Deep Think is also useful in mono mode — the analysis is injected directly into the single objective:
+
+```yaml
+task:
+  main_path: tasks/feature.md
+  deep_think: true
+  deep_think_model: sonnet      # cheaper for simple analysis
+  # decompose: false (default)
+```
+
+### Task chaining
+
+In sequential multi-task mode each subtask runs in its own `claude -p` session — a fresh process with no memory of the previous session's conversation. By default the only link between tasks is the shared memory namespace (agents are _asked_ to read/write checkpoints, but it's a soft contract).
+
+**`task.chain: true`** makes the link explicit and hard: after each task completes, rufler compresses its body and report into a compact text block and injects it into the next task's prompt as a `PREVIOUS TASK RETROSPECTIVE` section. The new Claude session sees exactly what was asked, what was done, and what the report said — without relying on memory polling.
+
+```yaml
+task:
+  multi: true
+  run_mode: sequential
+  chain: true
+  chain_max_tokens: 2000        # word budget for the retrospective (default 2000)
+  chain_include_report: true    # include per-task report in the retrospective (default true)
+  group:
+    - name: design
+      file_path: tasks/design.md
+    - name: implement
+      file_path: tasks/implement.md
+    - name: review
+      file_path: tasks/review.md
+      chain: false              # this task does NOT receive the retrospective
+```
+
+**How compression works.** The compressor is deterministic (no AI call) and fast:
+
+1. Strips HTML tags, horizontal rules, bold/italic markers
+2. Flattens fenced code blocks into one-line summaries (`[code:python: def hello()…]`)
+3. Downgrades markdown headers to `[Header]` form
+4. Collapses blank lines and whitespace
+5. Truncates to `chain_max_tokens` words
+
+The token budget is split between the task body (~2/3) and the report (~1/3). If `chain_include_report` is false or no report exists, the full budget goes to the body.
+
+**Per-task override.** Set `chain: false` on any group item to skip retrospective injection for that specific task, or `chain: true` on a single item when the global `task.chain` is false.
+
+**When to use chaining:**
+
+| Scenario | Use chain? |
+|---|---|
+| Tasks build on each other (design → implement → review) | Yes |
+| Tasks are independent (service_a, service_b) | No — use parallel mode instead |
+| You already rely on shared memory and it works well | Optional — chain adds redundancy |
+| Prompt budget is tight (very long task bodies + many tasks) | Tune `chain_max_tokens` down |
+
 ---
 
 ## Runs, projects and statuses
@@ -452,6 +601,18 @@ rufler tasks -a                    # all tasks across all runs
 rufler tasks --status running      # filter by status
 rufler tasks a1b2c3d4.01 -v       # detailed card for one task
 ```
+
+**Delete tasks:**
+
+```bash
+rufler tasks a1b2c3d4.05 --rm         # remove one task from the registry
+rufler tasks a1b2c3d4 --rm            # remove ALL tasks in that run
+rufler tasks --rm-all                  # remove all tasks across all runs in cwd
+rufler tasks --rm-all --rm-files       # also delete .rufler/tasks/*.md and log files
+rufler tasks a1b2c3d4 --rm --rm-files  # delete one run's tasks + files
+```
+
+`--rm` / `--rm-all` only touch the registry bookkeeping by default. Add `--rm-files` to also delete on-disk task files (`.rufler/tasks/*.md`) and their logs.
 
 Table columns: `TASK ID | SLOT | NAME | STATUS | SOURCE | STARTED | DURATION | TOKENS | LOG`.
 
