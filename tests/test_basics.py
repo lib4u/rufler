@@ -1080,19 +1080,79 @@ def test_find_resumable_run_no_match_different_dir(tmp_path: Path):
     assert found is None
 
 
-def test_completed_task_names_filters_rc_zero():
+def test_log_has_agent_output(tmp_path: Path):
+    from rufler.tasks.resolve import log_has_agent_output
+
+    # Missing path / None
+    assert log_has_agent_output(None) is False
+    assert log_has_agent_output(tmp_path / "nope.log") is False
+
+    # Empty log
+    empty = tmp_path / "empty.log"
+    empty.write_text("", encoding="utf-8")
+    assert log_has_agent_output(empty) is False
+
+    # Only rufler/ruflo lines, no claude assistant message
+    ruflo_only = tmp_path / "ruflo.log"
+    ruflo_only.write_text(
+        json.dumps({"src": "rufler", "text": "log started"}) + "\n"
+        + json.dumps({"src": "ruflo", "level": "info", "text": "init ok"}) + "\n"
+        + json.dumps({"src": "rufler", "text": "log ended rc=0"}) + "\n",
+        encoding="utf-8",
+    )
+    assert log_has_agent_output(ruflo_only) is False
+
+    # With a claude assistant message
+    with_asst = tmp_path / "asst.log"
+    with_asst.write_text(
+        json.dumps({"src": "rufler", "text": "log started"}) + "\n"
+        + json.dumps({
+            "src": "claude", "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "hello"}]},
+        }) + "\n",
+        encoding="utf-8",
+    )
+    assert log_has_agent_output(with_asst) is True
+
+
+def test_completed_task_names_filters_rc_zero(tmp_path: Path):
+    """Only tasks with rc=0, finished_at set, AND real claude output in
+    the log count as completed. The output check guards against the
+    bug where ruflo returns rc=0 without claude actually engaging —
+    without it, resume would skip past unfinished work."""
     from rufler.tasks import completed_task_names
+
+    def _write_log(name: str, with_output: bool) -> Path:
+        p = tmp_path / f"{name}.log"
+        lines = [json.dumps({"ts": 1.0, "src": "rufler", "text": "log started"})]
+        if with_output:
+            lines.append(json.dumps({
+                "ts": 2.0, "src": "claude", "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "hi"}]},
+            }))
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return p
+
+    done1_log = _write_log("done1", with_output=True)
+    done2_log = _write_log("done2", with_output=True)
+    phantom_log = _write_log("phantom", with_output=False)
+
     e = RunEntry(
         id="abc", project="p", flow_file="f", base_dir="/tmp",
         mode="fg", run_mode="seq", started_at=1.0,
         tasks=[
-            TaskEntry(name="done1", log_path="x", id="a.01", slot=1,
-                      rc=0, started_at=1.0, finished_at=2.0),
-            TaskEntry(name="failed", log_path="x", id="a.02", slot=2,
-                      rc=1, started_at=3.0, finished_at=4.0),
-            TaskEntry(name="pending", log_path="x", id="a.03", slot=3),
-            TaskEntry(name="done2", log_path="x", id="a.04", slot=4,
-                      rc=0, started_at=5.0, finished_at=6.0),
+            TaskEntry(name="done1", log_path=str(done1_log), id="a.01",
+                      slot=1, rc=0, started_at=1.0, finished_at=2.0),
+            TaskEntry(name="failed", log_path=str(done1_log), id="a.02",
+                      slot=2, rc=1, started_at=3.0, finished_at=4.0),
+            TaskEntry(name="pending", log_path=str(done1_log), id="a.03",
+                      slot=3),
+            TaskEntry(name="done2", log_path=str(done2_log), id="a.04",
+                      slot=4, rc=0, started_at=5.0, finished_at=6.0),
+            # rc=0 + finished_at set, but log has NO assistant output —
+            # must not be counted as done (fast-fail / phantom completion).
+            TaskEntry(name="phantom", log_path=str(phantom_log), id="a.05",
+                      slot=5, rc=0, started_at=7.0, finished_at=8.0),
         ],
     )
     done = completed_task_names(e)
@@ -1146,10 +1206,11 @@ def test_decompose_reuses_existing_files(tmp_path: Path):
 
 
 def test_decompose_ignores_existing_when_force_new(tmp_path: Path):
-    """With force_new=True, decompose should NOT reuse files.
-    Since we don't have claude in tests, it will fail — which proves
-    it tried to call the decomposer instead of reusing."""
+    """With force_new=True, decompose should NOT reuse files and should
+    invoke the decomposer instead. We mock out `claude` so the call is
+    deterministically absent regardless of test-host PATH."""
     import yaml as _yaml
+    from unittest.mock import patch
     from rufler.config import FlowConfig, TaskSpec
 
     tasks_dir = tmp_path / ".rufler" / "tasks"
@@ -1177,8 +1238,12 @@ def test_decompose_ignores_existing_when_force_new(tmp_path: Path):
 
     from rufler.run_steps import decompose_task_group
     from click.exceptions import Exit
-    with pytest.raises(Exit):
-        decompose_task_group(cfg, StubConsole(), force_new=True)
+    # Force `claude` to appear missing inside the decomposer so it raises
+    # and decompose_task_group escalates to Exit(1) — proving it tried to
+    # call the decomposer instead of silently reusing the stale yml.
+    with patch("rufler.decomposer._claude_bin", return_value=None):
+        with pytest.raises(Exit):
+            decompose_task_group(cfg, StubConsole(), force_new=True)
 
 
 # ---------- MCP config parsing ----------

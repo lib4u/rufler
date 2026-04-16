@@ -64,6 +64,105 @@ def restore_permissions(settings_path: Path, previous_mode: str | None) -> None:
         data["permissions"] = perms
     settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
+
+# Deny rules that hide `.rufler/**` from every Claude process spawned in
+# the project (deep_think, decomposer, hive-mind spawn). Written into
+# `.claude/settings.local.json` before any claude invocation so the LLM
+# can't wander into rufler's own logs/registry while working on the user's
+# code. Kept as a module constant so `restore_rufler_ignored` knows
+# exactly which entries to strip on cleanup.
+_RUFLER_IGNORE_PATHS = (".rufler/**", "./.rufler/**", "**/.rufler/**")
+_RUFLER_FILE_TOOLS = (
+    "Read", "Edit", "Write", "MultiEdit", "Glob", "Grep", "NotebookEdit",
+)
+_RUFLER_BASH_PREFIXES = (
+    "ls .rufler", "ls ./.rufler",
+    "cat .rufler", "cat ./.rufler",
+    "tail .rufler", "tail ./.rufler", "tail -f .rufler", "tail -f ./.rufler",
+    "head .rufler", "head ./.rufler",
+    "less .rufler", "less ./.rufler",
+    "cd .rufler", "cd ./.rufler",
+    "find .rufler", "find ./.rufler",
+    "tree .rufler", "tree ./.rufler",
+    "grep .rufler", "rg .rufler",
+)
+
+
+def _rufler_deny_rules() -> list[str]:
+    rules: list[str] = []
+    for tool in _RUFLER_FILE_TOOLS:
+        for pat in _RUFLER_IGNORE_PATHS:
+            rules.append(f"{tool}({pat})")
+    for prefix in _RUFLER_BASH_PREFIXES:
+        rules.append(f"Bash({prefix}:*)")
+    return rules
+
+
+def ensure_rufler_ignored(cwd: Path) -> tuple[Path, list | None]:
+    """Add deny rules for `.rufler/**` to `.claude/settings.local.json`.
+
+    Makes Claude skip rufler's own log/registry directory across every
+    phase (deep_think, decomposer, hive-mind spawn). Safe to call even
+    when the file or `permissions` key doesn't exist yet.
+
+    Returns ``(settings_path, previous_deny)`` so the caller can restore
+    the original list via :func:`restore_rufler_ignored`. ``previous_deny``
+    is ``None`` when the `deny` key was absent beforehand.
+    """
+    settings_dir = cwd / ".claude"
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    settings_path = settings_dir / "settings.local.json"
+
+    data: dict = {}
+    if settings_path.exists():
+        try:
+            data = json.loads(settings_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            data = {}
+
+    perms = data.get("permissions") if isinstance(data.get("permissions"), dict) else {}
+    existing_deny = perms.get("deny")
+    if isinstance(existing_deny, list):
+        previous_deny: list | None = list(existing_deny)
+    else:
+        previous_deny = None
+        existing_deny = []
+
+    merged = list(existing_deny)
+    for rule in _rufler_deny_rules():
+        if rule not in merged:
+            merged.append(rule)
+
+    perms["deny"] = merged
+    data["permissions"] = perms
+    settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return settings_path, previous_deny
+
+
+def restore_rufler_ignored(settings_path: Path, previous_deny: list | None) -> None:
+    """Restore `permissions.deny` to its pre-run value.
+
+    If *previous_deny* is ``None`` the key is removed; if it's an empty
+    list the key is set to ``[]``. Other keys under ``permissions`` are
+    left untouched.
+    """
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return
+    perms = data.get("permissions")
+    if not isinstance(perms, dict):
+        return
+    if previous_deny is None:
+        perms.pop("deny", None)
+    else:
+        perms["deny"] = previous_deny
+    if not perms:
+        data.pop("permissions", None)
+    else:
+        data["permissions"] = perms
+    settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
 console = Console()
 
 

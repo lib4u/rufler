@@ -6,12 +6,57 @@ effects beyond populating TaskEntry token fields in-place.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional
 
 from ..registry import Registry, RunEntry, TaskEntry
 from ..task_markers import scan_task_boundaries, derive_task_status
 from ..tokens import parse_log_range
+
+
+# Assistant output scan cap — large enough to hit the first claude reply
+# even in verbose runs, small enough that resume doesn't stall on huge logs.
+_LOG_SCAN_CAP_BYTES = 2_000_000
+
+
+def log_has_agent_output(log_path: Optional[Path]) -> bool:
+    """Return True if *log_path* contains at least one claude assistant
+    message — used to distinguish a real task completion from a rc=0
+    fast-fail (ruflo returning success without claude actually engaging,
+    prompt errors, missing bypass, etc).
+
+    Missing or unreadable logs return False — callers should treat that as
+    "not verified complete".
+    """
+    if log_path is None:
+        return False
+    p = Path(log_path)
+    if not p.exists():
+        return False
+    try:
+        size = p.stat().st_size
+    except OSError:
+        return False
+    if size == 0:
+        return False
+    read_n = min(size, _LOG_SCAN_CAP_BYTES)
+    try:
+        with open(p, "rb") as f:
+            chunk = f.read(read_n)
+    except OSError:
+        return False
+    for raw in chunk.decode("utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(rec, dict) and rec.get("type") == "assistant":
+            return True
+    return False
 
 
 def resolve_tasks_for_entry(
@@ -87,12 +132,19 @@ def find_resumable_run(
 
 def completed_task_names(entry: RunEntry) -> dict[str, TaskEntry]:
     """Return a mapping of {name: TaskEntry} for tasks that finished
-    successfully (rc == 0) in the given run.
+    successfully (rc == 0) AND produced real claude output in the given
+    run. Used by the resume logic to decide which tasks to skip.
 
-    Used by the resume logic to decide which tasks to skip.
+    The agent-output check guards against ruflo returning rc=0 without
+    claude actually engaging (fast-fail on permission prompts, broken
+    pipes, missing bypass, etc.) — without it, resume would inherit
+    phantom completions and skip past unfinished work.
     """
     out: dict[str, TaskEntry] = {}
     for te in entry.tasks:
-        if te.rc is not None and te.rc == 0 and te.finished_at is not None:
-            out[te.name] = te
+        if te.rc is None or te.rc != 0 or te.finished_at is None:
+            continue
+        if not log_has_agent_output(Path(te.log_path) if te.log_path else None):
+            continue
+        out[te.name] = te
     return out

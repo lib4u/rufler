@@ -27,6 +27,7 @@ from .models import (
     VALID_MCP_SERVER_FIELDS,
     VALID_RUN_MODES,
 )
+from ..templates import DENY_RULES_PROMPT
 
 
 # --------------- Parse helpers ---------------
@@ -288,6 +289,10 @@ class FlowConfig:
         from ..tasks.chain import build_retrospective
 
         lines: list[str] = []
+        # DENY_RULES_PROMPT is always first — takes precedence over every
+        # downstream instruction (agent prompts, task body, chain history).
+        lines.append(DENY_RULES_PROMPT.rstrip())
+        lines.append("")
         lines.append(f"# PROJECT: {self.project.name}")
         if self.project.description:
             lines.append(self.project.description.strip())

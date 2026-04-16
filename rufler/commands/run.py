@@ -27,7 +27,13 @@ from ..run_steps import (
     resolve_exec_overrides,
     run_deep_think,
 )
-from ..runner import Runner, ensure_bypass_permissions, restore_permissions
+from ..runner import (
+    Runner,
+    ensure_bypass_permissions,
+    ensure_rufler_ignored,
+    restore_permissions,
+    restore_rufler_ignored,
+)
 from ..skills import fmt_custom_entry
 from ..task_markers import emit_task_marker
 from ..tasks import (
@@ -123,6 +129,15 @@ def register(app: typer.Typer, console: Console) -> None:
 
         runner = Runner(cwd=cfg.base_dir)
         base_task_id = f"rufler-{cfg.project.name}-{int(time.time())}"
+
+        # Write .claude/settings.local.json BEFORE anything else spawns —
+        # ruflo's own init / daemon / hooks pipeline can invoke claude, and
+        # so do deep_think / decomposer / hive-mind spawn. Placing this at
+        # the very top of the run guarantees `.rufler/**` deny rules are in
+        # place for every subprocess that opens in this cwd.
+        _rufler_ignore_path, _rufler_previous_deny = ensure_rufler_ignored(
+            cfg.base_dir,
+        )
 
         eff = resolve_exec_overrides(cfg, background, non_interactive, yolo, log_file)
 
@@ -296,6 +311,13 @@ def register(app: typer.Typer, console: Console) -> None:
                                     te.started_at = prev_te.started_at
                                     te.finished_at = prev_te.finished_at
                                     te.rc = 0
+                                    # Inherit the original log so future
+                                    # resumes still see claude's real
+                                    # output when verifying completion —
+                                    # the new run's log path for this
+                                    # slot will stay empty.
+                                    if prev_te.log_path:
+                                        te.log_path = prev_te.log_path
                         registry.update(reg_entry)
                         remaining = len(reg_entry.tasks) - len(skip_slots)
                         first_active = next(
@@ -516,6 +538,8 @@ def register(app: typer.Typer, console: Console) -> None:
 
         if _perm_settings_path is not None:
             restore_permissions(_perm_settings_path, _perm_previous_mode)
+
+        restore_rufler_ignored(_rufler_ignore_path, _rufler_previous_deny)
 
         finalize_run(reg_entry, registry, base_task_id, con)
         if eff.background:

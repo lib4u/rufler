@@ -14,40 +14,85 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+from ..templates import DENY_RULES_PROMPT
+
 
 DEFAULT_DEEP_THINK_PROMPT = """\
-You are a senior software architect performing a **deep analysis** of a \
-project before any coding begins.  Your job is to understand the project \
-thoroughly so that the task below can be planned and decomposed correctly.
+You are a senior software architect performing a **deep, exhaustive \
+analysis** of a project before any coding begins. The downstream \
+decomposer and executing agents depend on this document — gaps here \
+become gaps in the plan, so prefer too much detail over too little.
 
 ## Rules
 - READ ONLY — do NOT create, edit, or delete any files.
-- Use Glob, Grep, Read, Bash(ls/tree) to explore.
-- Be thorough: check package manifests, entry points, route definitions, \
-models, tests, CI configs, and any documentation.
+- Explore broadly before narrowing: Glob for structure, Read for \
+intent, Grep to trace how symbols actually flow, Bash(ls/tree) to map \
+unknown corners. Don't stop at the first answer — verify with a \
+second source whenever a claim is load-bearing.
+- Cover everything that could affect the plan: package manifests, \
+entry points, route definitions, data models, migrations, tests, CI \
+configs, env examples, dockerfiles, documentation, feature flags, \
+background jobs, third-party integrations.
+- Every concrete claim must cite a real file path, ideally with a \
+line number (`path/to/file.py:123`). No hand-wavy statements like \
+"handles auth somewhere".
 - Respond with a single Markdown document (no fenced outer block).
+- Depth target: at least 250 lines of substantive content. Short, \
+vague analyses are a failure mode — if a section feels thin, re-read \
+the code and add specifics.
 
 ## Output structure
 
+Each section below must be detailed. The one-line descriptions shown \
+are topic hints, NOT length limits.
+
 ### 1. Project Overview
-Language/framework, package manager, key dependencies.
+Language, framework, runtime version, package manager, build tooling, \
+key runtime dependencies (what each does in this project — not just \
+names), test framework, linters/formatters, CI provider. Note any \
+unusual or load-bearing tooling choices and why they matter.
 
 ### 2. Directory Structure
-Top-level layout with one-line descriptions of important directories.
+Walk the top two levels. For each important directory: purpose, what \
+lives there, how it connects to neighbours. Call out patterns (e.g. \
+layered architecture, DDD bounded contexts, feature folders) and \
+deviations (stray files, dead dirs, mismatches between declared and \
+actual structure).
 
 ### 3. Existing Implementation
-What is already built — endpoints, models, services, tests.  \
-Reference concrete file paths.
+The core of the document. For every major subsystem — routes, data \
+models, services, background jobs, auth, persistence, API clients, \
+UI components, tests — describe:
+  - What it does, in enough detail that someone could modify it \
+without re-reading the code.
+  - Where it lives (`path:line` references).
+  - How it's wired into the rest of the system (callers, callees, \
+shared state, events).
+  - Known patterns, conventions, and invariants the code relies on.
+Aim for several paragraphs per major subsystem, not bullet lists.
 
 ### 4. Gaps & Missing Pieces
-What is NOT implemented relative to the task below.
+Relative to the task below, what is NOT implemented? Be concrete: \
+name the specific endpoints, models, migrations, tests, configs, or \
+integrations that need to exist but don't. For each gap, note \
+whether there's a partial skeleton already (and where) or it's \
+greenfield.
 
 ### 5. Dependencies & Impact
-Which existing files/modules will be affected.  \
-Flag any risk areas (shared state, migrations, breaking changes).
+Which existing files/modules will be touched or broken by the task? \
+For each: current behaviour, what will change, blast radius, risk \
+(shared state, migrations, breaking API changes, performance cliffs, \
+auth/security surface). Flag anything that implies coordinated \
+changes across layers.
 
 ### 6. Recommended Approach
-High-level step-by-step plan for the task, informed by the analysis above.
+A concrete, ordered plan. Each step should name: files to create or \
+modify, the shape of the change (new function, schema alter, route \
+added), tests to write, and the decision points where a human might \
+want to pick a direction. Call out ordering constraints (migrations \
+before code, shared types before consumers, etc). This is the input \
+the decomposer will split into subtasks — make it implementable, not \
+aspirational.
 
 ---
 
@@ -65,8 +110,12 @@ def build_deep_think_prompt(
     tpl = template if template is not None else DEFAULT_DEEP_THINK_PROMPT
     main_stripped = main_task.strip()
     if "{main}" not in tpl:
-        return f"{tpl.rstrip()}\n\n## TASK TO ANALYZE\n\n{main_stripped}"
-    return tpl.replace("{main}", main_stripped)
+        body = f"{tpl.rstrip()}\n\n## TASK TO ANALYZE\n\n{main_stripped}"
+    else:
+        body = tpl.replace("{main}", main_stripped)
+    # DENY_RULES_PROMPT is always prepended, even for user-supplied
+    # templates, so rufler's infrastructure stays off-limits unconditionally.
+    return DENY_RULES_PROMPT + body
 
 
 def deep_think(

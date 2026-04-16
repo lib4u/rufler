@@ -17,6 +17,8 @@ from typing import Optional
 
 import yaml
 
+from .templates import DENY_RULES_PROMPT
+
 DEFAULT_DECOMPOSE_PROMPT = """\
 You are a task decomposer. Split the MAIN TASK below into exactly {n} \
 sequential subtasks. Each subtask must be self-contained, actionable, and \
@@ -52,11 +54,16 @@ def build_prompt(main_task: str, count: int, template: Optional[str] = None) -> 
     tpl = template if template is not None else DEFAULT_DECOMPOSE_PROMPT
     main_stripped = main_task.strip()
     if "{main}" not in tpl and "{n}" not in tpl:
-        return (
+        body = (
             f"{tpl.rstrip()}\n\nMAIN TASK:\n{main_stripped}\n\n"
             f"Generate exactly {count} subtasks."
         )
-    return tpl.replace("{n}", str(count)).replace("{main}", main_stripped)
+    else:
+        body = tpl.replace("{n}", str(count)).replace("{main}", main_stripped)
+    # DENY_RULES_PROMPT is always prepended, even when `template` is a
+    # user-supplied custom prompt — rufler's own infrastructure must stay
+    # off-limits regardless of what the user writes.
+    return DENY_RULES_PROMPT + body
 
 
 def _claude_bin() -> Optional[str]:
