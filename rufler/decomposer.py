@@ -91,11 +91,14 @@ def decompose(
     model: str = "sonnet",
     effort: str = "high",
     prompt_template: Optional[str] = None,
+    log_path: Optional[Path] = None,
 ) -> list[dict]:
     """Call claude -p, parse YAML, write subtask files + companion yml.
 
     `prompt_template` optionally overrides the built-in decomposer prompt.
     It may include `{n}` and `{main}` placeholders.
+    When *log_path* is given, claude's stream-json output is written to
+    the NDJSON log in real time so ``rufler follow`` can show progress.
 
     Returns the list of parsed subtasks (name, title, content, file_path).
     """
@@ -116,8 +119,13 @@ def decompose(
         "--dangerously-skip-permissions",
         prompt,
     ]
+
+    from .stream_log import stream_claude
+
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        res = stream_claude(
+            cmd, log_path=log_path, timeout=300, phase="decompose",
+        )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(f"claude decompose timed out after 300s: {e}") from e
     if res.returncode != 0:

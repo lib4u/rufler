@@ -50,25 +50,37 @@ def read_skill_description(skill_md: Path, limit: int = 120) -> str:
     return "-"
 
 
-def render_skills_table(root: Path, title: str, console: Console) -> int:
-    """Print a skills table for every immediate subdirectory of `root`.
-    Returns the number of skill directories rendered."""
-    console.rule(f"[bold]{title}[/bold] [dim]{root}[/dim]")
-    table = Table(show_lines=False)
-    table.add_column("NAME", style="cyan", no_wrap=True)
-    table.add_column("SKILL.md", justify="center")
-    table.add_column("DESCRIPTION", overflow="fold")
-    count = 0
+def collect_skills_rows(root: Path) -> list[list[str]]:
+    """Scan ``root`` for skill subdirectories and return table rows.
+
+    Each row is ``[name, has_skill_md, description]``.
+    """
+    rows: list[list[str]] = []
     for child in sorted(root.iterdir()):
         if not child.is_dir():
             continue
         skill_md = child / "SKILL.md"
         has_md = skill_md.exists()
         desc = read_skill_description(skill_md) if has_md else "-"
-        table.add_row(child.name, "✓" if has_md else "✗", desc)
-        count += 1
+        rows.append([child.name, "✓" if has_md else "✗", desc])
+    return rows
+
+
+def render_skills_table(root: Path, title: str, console: Console) -> int:
+    """Print a skills table for every immediate subdirectory of `root`.
+    Returns the number of skill directories rendered."""
+    rows = collect_skills_rows(root)
+
+    console.rule(f"[bold]{title}[/bold] [dim]{root}[/dim]")
+    table = Table(show_lines=False)
+    table.add_column("NAME", style="cyan", no_wrap=True)
+    table.add_column("SKILL.md", justify="center")
+    table.add_column("DESCRIPTION", overflow="fold")
+    for row in rows:
+        table.add_row(*row)
     console.print(table)
-    return count
+
+    return len(rows)
 
 
 def fmt_custom_entry(e: "str | SkillsShEntry") -> str:

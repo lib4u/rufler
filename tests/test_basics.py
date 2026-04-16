@@ -155,7 +155,7 @@ def test_status_exited_when_log_rc_zero(tmp_path: Path):
     )
     e.pids = [99999999]  # not alive
     Registry(path=tmp_path / "r.json").refresh_status(e)
-    assert e.status == "exited"
+    assert e.status == "done"
     assert e.exit_code == 0
 
 
@@ -766,7 +766,7 @@ def test_derive_task_status_running():
 def test_derive_task_status_exited():
     from rufler.task_markers import derive_task_status, TaskBoundary
     tb = TaskBoundary(task_id="x.01", slot=1, started=True, ended=True, rc=0)
-    assert derive_task_status(tb, run_status="exited", run_rc=0) == "exited"
+    assert derive_task_status(tb, run_status="done", run_rc=0) == "done"
 
 
 def test_derive_task_status_failed():
@@ -783,7 +783,7 @@ def test_derive_task_status_stopped():
 
 def test_derive_task_status_skipped():
     from rufler.task_markers import derive_task_status
-    assert derive_task_status(None, run_status="exited", run_rc=0) == "skipped"
+    assert derive_task_status(None, run_status="done", run_rc=0) == "skipped"
 
 
 # ---------- per-task token accounting ----------

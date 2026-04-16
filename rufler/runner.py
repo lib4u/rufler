@@ -10,12 +10,16 @@ from rich.console import Console
 from .checks import resolve_ruflo_cmd
 
 
-def ensure_bypass_permissions(cwd: Path) -> Path:
+def ensure_bypass_permissions(cwd: Path) -> tuple[Path, str | None]:
     """Write .claude/settings.local.json with permissions.defaultMode=bypassPermissions.
 
     This is a belt-and-suspenders fix: even if ruflo's arg parser drops
     --dangerously-skip-permissions when objective is huge, Claude Code will
     still read the project-local setting and skip prompts.
+
+    Returns ``(settings_path, previous_default_mode)`` so the caller can
+    restore the original value via :func:`restore_permissions` after the
+    run finishes.
     """
     settings_dir = cwd / ".claude"
     settings_dir.mkdir(parents=True, exist_ok=True)
@@ -29,11 +33,36 @@ def ensure_bypass_permissions(cwd: Path) -> Path:
             data = {}
 
     perms = data.get("permissions") if isinstance(data.get("permissions"), dict) else {}
+    previous_mode: str | None = perms.get("defaultMode")
     perms["defaultMode"] = "bypassPermissions"
     data["permissions"] = perms
 
     settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return settings_path
+    return settings_path, previous_mode
+
+
+def restore_permissions(settings_path: Path, previous_mode: str | None) -> None:
+    """Restore ``permissions.defaultMode`` to its pre-run value.
+
+    If *previous_mode* is ``None`` the key is removed entirely so the
+    file looks exactly as it did before ``ensure_bypass_permissions``.
+    """
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return
+    perms = data.get("permissions")
+    if not isinstance(perms, dict):
+        return
+    if previous_mode is None:
+        perms.pop("defaultMode", None)
+    else:
+        perms["defaultMode"] = previous_mode
+    if not perms:
+        data.pop("permissions", None)
+    else:
+        data["permissions"] = perms
+    settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 console = Console()
 

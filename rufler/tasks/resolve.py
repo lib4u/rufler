@@ -32,13 +32,13 @@ def resolve_tasks_for_entry(
         )
 
         if te.finished_at and te.rc is not None:
-            status_from_entry = "exited" if te.rc == 0 else "failed"
+            status_from_entry = "done" if te.rc == 0 else "failed"
             if status in ("queued", "skipped", "dead"):
                 status = status_from_entry
 
         if te.started_at and tb and not tb.started:
             if status == "queued":
-                status = "running" if entry.status == "running" else "exited"
+                status = "running" if entry.status == "running" else "done"
 
         tok = 0
         if lp and lp.exists():

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json as _json
 import os
+import resource
 import time
 from pathlib import Path
 from typing import Optional
@@ -47,6 +48,9 @@ def daemonize(log_path: Path) -> None:
     os.setsid()
     if os.fork() > 0:
         os._exit(0)
+    # Close inherited fds (3..max) to avoid leaking parent's sockets/pipes.
+    max_fd = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    os.closerange(3, max_fd)
     try:
         devnull = os.open(os.devnull, os.O_RDONLY)
         os.dup2(devnull, 0)

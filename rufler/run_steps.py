@@ -63,6 +63,7 @@ def run_deep_think(
     console: Console,
     *,
     force_new: bool = False,
+    log_path: Optional[Path] = None,
 ) -> str | None:
     """Run the Deep Think phase — analyze the project before decompose/execute.
 
@@ -126,6 +127,7 @@ def run_deep_think(
             prompt_template=prompt_template,
             timeout=cfg.task.deep_think_timeout,
             budget=cfg.task.deep_think_budget,
+            log_path=log_path,
             **extra_kw,
         )
     except Exception as e:
@@ -144,6 +146,7 @@ def decompose_task_group(
     *,
     force_new: bool = False,
     analysis: str | None = None,
+    log_path: Optional[Path] = None,
 ) -> None:
     """Decompose `task.main` into `task.decompose_count` subtasks via a
     claude-powered decomposer, then mutate `cfg.task.group` in place.
@@ -243,6 +246,7 @@ def decompose_task_group(
             model=cfg.task.decompose_model,
             effort=cfg.task.decompose_effort,
             prompt_template=prompt_template,
+            log_path=log_path,
         )
     except Exception as e:
         console.print(f"[red]decomposer failed:[/red] {e}")

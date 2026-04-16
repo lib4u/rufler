@@ -24,10 +24,10 @@ slots in cleanly).
 
 Status derivation (`derive_task_status`):
   - has task_start, no task_end, log still growing / pid alive → "running"
-  - has task_start + task_end rc==0 → "exited"
+  - has task_start + task_end rc==0 → "done"
   - has task_start + task_end rc!=0 → "failed"
   - task_end missing but log tail shows `log ended rc=N`
-    (parallel mode fallback — orchestrator detached before writing end) → "exited"/"failed"
+    (parallel mode fallback — orchestrator detached before writing end) → "done"/"failed"
   - no task_start, run still queued → "queued"
   - no task_start, run finished → "skipped"
 """
@@ -174,16 +174,16 @@ def derive_task_status(
         return "skipped"
     if tb.ended:
         if tb.rc is None:
-            return "exited" if run_status == "exited" else "failed"
-        return "exited" if tb.rc == 0 else "failed"
+            return "done" if run_status == "done" else "failed"
+        return "done" if tb.rc == 0 else "failed"
     # Started but no explicit end.
     if run_status == "running":
         return "running"
-    if run_status in ("exited", "failed"):
+    if run_status in ("done", "failed"):
         # Parallel-mode fallback: orchestrator detached before task_end,
         # inherit the run's verdict.
-        if run_status == "exited" and (run_rc is None or run_rc == 0):
-            return "exited"
+        if run_status == "done" and (run_rc is None or run_rc == 0):
+            return "done"
         return "failed"
     if run_status == "stopped":
         return "stopped"

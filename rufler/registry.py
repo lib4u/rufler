@@ -403,7 +403,7 @@ class Registry:
         rc = _tail_rc(log) if log else None
         if rc is not None:
             entry.exit_code = rc
-            entry.status = "exited" if rc == 0 else "failed"
+            entry.status = "done" if rc == 0 else "failed"
             if entry.finished_at is None:
                 try:
                     entry.finished_at = log.stat().st_mtime if log else time.time()

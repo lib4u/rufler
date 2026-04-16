@@ -17,5 +17,25 @@ rufler = "rufler.cli:app"
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+[project.optional-dependencies]
+tui = [
+    "textual>=1.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "mypy>=1.10",
+]
+
 [tool.setuptools.packages.find]
 include = ["rufler*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

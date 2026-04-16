@@ -23,6 +23,8 @@ from rich.progress_bar import ProgressBar
 from rich.table import Table
 from rich.text import Text
 
+from .tokens import fmt_tokens as _fmt_tokens
+
 LEVEL_COLOR = {
     "error": "bold red",
     "warn": "yellow",
@@ -54,6 +56,15 @@ CONV_KIND_STYLE = {
     "text": "white",
     "tool_use": "bold cyan",
     "tool_result": "dim green",
+    "phase": "bold yellow",
+}
+
+CONV_KIND_ICON = {
+    "thinking": "💭",
+    "text": "💬",
+    "tool_use": "🔧",
+    "tool_result": "📎",
+    "phase": "🚀",
 }
 
 
@@ -118,6 +129,21 @@ class TuiState:
         # ---- rufler supervisor markers ----
         if src == "rufler":
             text = rec.get("text") or ""
+
+            if t == "phase_start":
+                phase = rec.get("phase") or "?"
+                self.status = "running"
+                self._push_event(ts, "info", f"phase started: {phase}")
+                self.conversation.append(
+                    (ts, "phase", f"▶ {phase} started"))
+                return
+
+            if t == "phase_end":
+                phase = rec.get("phase") or "?"
+                self._push_event(ts, "ok", f"phase ended: {phase}")
+                self.conversation.append(
+                    (ts, "phase", f"✓ {phase} done"))
+                return
 
             if t == "task_start":
                 name = rec.get("name") or ""
@@ -337,13 +363,6 @@ def _stringify(x) -> str:
     return ""
 
 
-def _fmt_tokens(n: int) -> str:
-    if n < 1000:
-        return str(n)
-    if n < 1_000_000:
-        return f"{n / 1000:.1f}K"
-    return f"{n / 1_000_000:.2f}M"
-
 
 def _fmt_dur(secs: float) -> str:
     if secs < 60:
@@ -465,15 +484,10 @@ def _render(state: TuiState) -> Layout:
     conv_items = list(state.conversation)
     for cts, kind, ctext in conv_items[-20:]:
         kind_style = CONV_KIND_STYLE.get(kind, "")
-        kind_label = {
-            "thinking": "think",
-            "text": "text",
-            "tool_use": "tool",
-            "tool_result": "result",
-        }.get(kind, kind)
+        icon = CONV_KIND_ICON.get(kind, " ")
         conv_tbl.add_row(
             time.strftime("%H:%M:%S", time.localtime(cts)),
-            Text(kind_label, style=kind_style),
+            Text(icon, style=kind_style),
             Text(ctext[:300], style=kind_style),
         )
 

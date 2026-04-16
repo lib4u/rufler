@@ -79,10 +79,13 @@ def deep_think(
     timeout: int = 600,
     allowed_tools: Optional[str] = None,
     budget: Optional[float] = None,
+    log_path: Optional[Path] = None,
 ) -> str:
     """Run a read-only claude session to analyze the project.
 
     Returns the analysis text.  Also writes it to *output_path*.
+    When *log_path* is given, claude's stream-json output is written to
+    the NDJSON log in real time so ``rufler follow`` can show progress.
     Raises ``RuntimeError`` on failure.
     """
     claude = shutil.which("claude")
@@ -105,8 +108,12 @@ def deep_think(
         cmd.extend(["--max-budget-usd", str(budget)])
     cmd.append(prompt)
 
+    from ..stream_log import stream_claude
+
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        res = stream_claude(
+            cmd, log_path=log_path, timeout=timeout, phase="deep_think",
+        )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(f"deep_think timed out after {timeout}s: {e}") from e
 

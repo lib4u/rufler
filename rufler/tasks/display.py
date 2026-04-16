@@ -22,7 +22,7 @@ from ..tokens import fmt_tokens
 TASK_STATUS_COLORS = {
     "queued": "dim",
     "running": "green",
-    "exited": "blue",
+    "done": "blue",
     "failed": "red",
     "stopped": "yellow",
     "skipped": "bright_black",
@@ -55,6 +55,22 @@ def fmt_duration(started: Optional[float], finished: Optional[float],
     return f"{dur / 3600:.1f}h{suffix}"
 
 
+def _task_preview(te: TaskEntry, limit: int = 100) -> str:
+    """Return the first *limit* chars of a task's body, or '-' if unavailable."""
+    if te.file_path:
+        fp = Path(te.file_path)
+        if fp.exists():
+            try:
+                text = fp.read_text(encoding="utf-8", errors="replace")
+                text = " ".join(text.split())  # collapse whitespace
+                if len(text) > limit:
+                    return text[:limit] + "…"
+                return text if text else "-"
+            except OSError:
+                pass
+    return "-"
+
+
 def render_tasks_table(
     rows: list[tuple[RunEntry, TaskEntry, str, int]],
     *,
@@ -74,7 +90,7 @@ def render_tasks_table(
     table.add_column("STARTED", style="dim")
     table.add_column("DURATION", justify="right")
     table.add_column("TOKENS", justify="right", style="magenta")
-    table.add_column("LOG", overflow="fold", style="dim")
+    table.add_column("PREVIEW", max_width=60, overflow="ellipsis", style="dim")
 
     for entry, te, st, tok in rows:
         color = TASK_STATUS_COLORS.get(st, "white")
@@ -83,18 +99,18 @@ def render_tasks_table(
         duration = fmt_duration(te.started_at, te.finished_at,
                                 running=(st == "running"))
         tokens_cell = fmt_tokens(tok) if tok else "-"
-        log_short = Path(te.log_path).name if te.log_path else "-"
+        preview = _task_preview(te)
 
         row = [te.id, str(te.slot), te.name, status_cell, te.source]
         if show_run_column:
             row.append(entry.id)
-        row.extend([started, duration, tokens_cell, log_short])
+        row.extend([started, duration, tokens_cell, preview])
         table.add_row(*row)
 
     console.print(table)
 
     total_tokens = sum(tok for _, _, _, tok in rows)
-    n_done = sum(1 for _, _, st, _ in rows if st == "exited")
+    n_done = sum(1 for _, _, st, _ in rows if st == "done")
     n_running = sum(1 for _, _, st, _ in rows if st == "running")
     n_queued = sum(1 for _, _, st, _ in rows if st == "queued")
     n_failed = sum(1 for _, _, st, _ in rows if st == "failed")

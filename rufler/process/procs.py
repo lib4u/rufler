@@ -8,7 +8,6 @@ leader PID.
 from __future__ import annotations
 
 import os
-import subprocess
 import time
 from pathlib import Path
 from typing import Optional
@@ -38,38 +37,76 @@ def fmt_age(ts: Optional[float]) -> str:
 def find_claude_procs(project_dir: Path) -> list[dict]:
     """Return live `claude -p` processes whose working dir is inside project_dir.
 
-    Linux-only (relies on /proc/<pid>/cwd). On other platforms returns [].
+    Linux-only — reads ``/proc/<pid>/cmdline`` directly instead of parsing
+    ``ps -eo`` output, which avoids breakage when command-line formatting
+    changes or ``ps`` is unavailable. On other platforms returns [].
     """
-    if not Path("/proc").is_dir():
-        return []
-
-    try:
-        out = subprocess.run(
-            ["ps", "-eo", "pid,etime,command"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
+    proc = Path("/proc")
+    if not proc.is_dir():
         return []
 
     procs: list[dict] = []
     target = str(project_dir.resolve())
-    for line in out.splitlines()[1:]:
-        parts = line.strip().split(None, 2)
-        if len(parts) < 3:
+    my_pid = os.getpid()
+
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
             continue
-        pid_s, etime, cmd = parts
-        if "claude -p" not in cmd:
+        pid = int(entry.name)
+        if pid == my_pid:
             continue
         try:
-            cwd = Path(f"/proc/{pid_s}/cwd").resolve()
+            cmdline_raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if not cmdline_raw:
+            continue
+        argv = cmdline_raw.rstrip(b"\x00").split(b"\x00")
+        argv_strs = [a.decode("utf-8", errors="replace") for a in argv]
+        # Match: any argv[i] ending with "claude" followed by "-p" anywhere.
+        has_claude = any(
+            a.endswith("claude") or a.endswith("claude.js") for a in argv_strs
+        )
+        has_p_flag = "-p" in argv_strs or "--print" in argv_strs
+        if not (has_claude and has_p_flag):
+            continue
+        try:
+            cwd = (entry / "cwd").resolve()
         except OSError:
             continue
         if not str(cwd).startswith(target):
             continue
-        procs.append({"pid": int(pid_s), "etime": etime, "cmd": cmd[:80]})
+        # Compute elapsed time from /proc/<pid>/stat field 22 (starttime).
+        etime = _proc_etime(pid)
+        cmd = " ".join(argv_strs)[:80]
+        procs.append({"pid": pid, "etime": etime, "cmd": cmd})
     return procs
+
+
+def _proc_etime(pid: int) -> str:
+    """Compute elapsed time string from ``/proc/<pid>/stat`` starttime.
+
+    Falls back to ``"-"`` on any error.
+    """
+    try:
+        stat_raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        rp = stat_raw.rfind(")")
+        if rp < 0:
+            return "-"
+        fields = stat_raw[rp + 2:].split()
+        # Field index 19 (0-based after the comm closing paren) is starttime
+        # in clock ticks since boot.
+        starttime_ticks = int(fields[19])
+        clk_tck = os.sysconf("SC_CLK_TCK")
+
+        uptime_secs = float(Path("/proc/uptime").read_text().split()[0])
+        start_secs = starttime_ticks / clk_tck
+        # Process started at boot_time + start_secs; boot_time = now - uptime
+        boot_epoch = time.time() - uptime_secs
+        proc_start_epoch = boot_epoch + start_secs
+        return fmt_age(proc_start_epoch)
+    except (OSError, ValueError, IndexError):
+        return "-"
 
 
 def kill_pid_tree(pid: int, sig) -> int:
