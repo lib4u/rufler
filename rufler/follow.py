@@ -607,19 +607,23 @@ def follow(
     offsets: dict[str, int] = {str(p.resolve()): 0 for _, p in log_sources}
 
     def _tail_all() -> None:
+        # Binary mode: offsets are true byte positions, so seek is exact
+        # regardless of multi-byte UTF-8 content (Cyrillic text from
+        # claude, emojis in stream-json, etc). Reading in text mode and
+        # treating offsets as bytes desyncs the decoder from the file
+        # position and silently drops lines after any non-ASCII content.
         for _tname, lp in log_sources:
             key = str(lp.resolve())
             if not lp.exists():
                 continue
             try:
-                with open(lp, "r", encoding="utf-8", errors="replace") as f:
+                with open(lp, "rb") as f:
                     f.seek(offsets[key])
-                    for line in f:
-                        if not line.endswith("\n"):
+                    for raw in f:
+                        if not raw.endswith(b"\n"):
                             break
-                        offsets[key] += len(
-                            line.encode("utf-8", errors="replace"))
-                        line = line.strip()
+                        offsets[key] += len(raw)
+                        line = raw.decode("utf-8", errors="replace").strip()
                         if not line:
                             continue
                         try:

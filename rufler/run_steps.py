@@ -172,21 +172,44 @@ def decompose_task_group(
     yml_out = (cfg.base_dir / cfg.task.decompose_file).resolve()
 
     if not force_new and yml_out.exists():
+        # Strict cache validation: either ALL subtask files exist on
+        # disk OR we treat the cache as invalid and regenerate. A
+        # partial cache (some .md files missing) would otherwise cause
+        # rufler to silently proceed with a truncated task list, which
+        # is worse than just redoing the decompose.
         try:
             raw = _yaml.safe_load(yml_out.read_text(encoding="utf-8")) or {}
-            group_raw = (raw.get("task") or {}).get("group") or []
+        except Exception as e:
+            console.print(
+                f"[yellow]decompose: cache yml malformed ({e}) — "
+                f"regenerating[/yellow]"
+            )
+            raw = None
+
+        if raw is not None:
+            task_block = raw.get("task") or {}
+            group_raw = task_block.get("group") or []
+            missing: list[str] = []
             items: list[TaskItem] = []
             for g in group_raw:
                 if not isinstance(g, dict):
                     continue
                 name = str(g.get("name") or "")
                 fp = g.get("file_path") or ""
+                if not name or not fp:
+                    missing.append(name or f"<unnamed:{fp!r}>")
+                    continue
                 resolved_fp = (yml_out.parent / fp).resolve()
-                if not name or not resolved_fp.exists():
+                if not resolved_fp.exists():
+                    missing.append(f"{name} ({fp})")
                     continue
                 items.append(TaskItem(name=name, file_path=str(resolved_fp)))
-            if items:
+
+            if items and not missing and group_raw:
                 cfg.task.group = items
+                ps = task_block.get("project_summary")
+                if isinstance(ps, str) and ps.strip():
+                    cfg.task.project_summary = ps.strip()
                 console.rule("[bold]0. decompose (reusing existing)[/bold]")
                 console.print(
                     f"[dim]loaded {len(items)} subtask(s) from {yml_out}[/dim]"
@@ -195,8 +218,22 @@ def decompose_task_group(
                     f"[dim]use [bold]--new[/bold] to regenerate from scratch[/dim]"
                 )
                 return
-        except Exception:
-            pass
+            # Cache partial or empty — log why and fall through to regen.
+            if missing or not group_raw:
+                console.rule("[bold]0. decompose (cache invalid — regenerating)[/bold]")
+                if not group_raw:
+                    console.print(
+                        f"[yellow]cache yml has no `task.group` — "
+                        f"starting fresh decomposition[/yellow]"
+                    )
+                else:
+                    console.print(
+                        f"[yellow]cache references {len(group_raw)} subtask(s) "
+                        f"but {len(missing)} file(s) missing on disk: "
+                        f"{', '.join(missing[:5])}"
+                        f"{'...' if len(missing) > 5 else ''} — "
+                        f"regenerating[/yellow]"
+                    )
 
     try:
         main_body = cfg.task.resolved_main(cfg.base_dir)
@@ -236,20 +273,72 @@ def decompose_task_group(
     if prompt_template:
         console.print("[dim]using custom decomposer prompt from yml[/dim]")
 
-    try:
-        from .decomposer import decompose
-        written = decompose(
-            main_body,
-            cfg.task.decompose_count,
-            out_dir,
-            yml_out,
-            model=cfg.task.decompose_model,
-            effort=cfg.task.decompose_effort,
-            prompt_template=prompt_template,
-            log_path=log_path,
+    # Decompose with one retry on parse / structural failures. YAML
+    # extraction can fail on unlucky outputs (nested fenced blocks,
+    # rare claude formatting quirks); a second attempt typically
+    # succeeds with different sampling.
+    from .decomposer import decompose
+    result = None
+    last_err: Optional[Exception] = None
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if attempt > 1:
+                console.print(
+                    f"[yellow]decompose: retry {attempt}/{max_attempts} "
+                    f"after previous failure...[/yellow]"
+                )
+            result = decompose(
+                main_body,
+                cfg.task.decompose_count,
+                out_dir,
+                yml_out,
+                model=cfg.task.decompose_model,
+                effort=cfg.task.decompose_effort,
+                timeout=cfg.task.decompose_timeout,
+                prompt_template=prompt_template,
+                log_path=log_path,
+            )
+            break
+        except Exception as e:
+            last_err = e
+            console.print(
+                f"[red]decomposer attempt {attempt} failed:[/red] {e}"
+            )
+
+    if result is None:
+        console.print(
+            f"[red]decomposer failed after {max_attempts} attempts.[/red] "
+            f"Last error: {last_err}"
         )
-    except Exception as e:
-        console.print(f"[red]decomposer failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    written = result["tasks"]
+    if result.get("project_summary"):
+        cfg.task.project_summary = result["project_summary"]
+    else:
+        console.print(
+            "[yellow]decomposer: project_summary missing from output — "
+            "subtasks will run without a shared north-star block[/yellow]"
+        )
+
+    # Post-validation: decompose() may have recorded tasks in its
+    # return value while failing to persist some .md files (disk
+    # permissions, interrupted write, buggy decomposer change). If any
+    # file is missing, fail loudly — silently proceeding with a
+    # truncated task list causes the "decompose finished but no
+    # tasks" confusion.
+    missing_written: list[str] = []
+    for w in written:
+        resolved = (yml_out.parent / w["file_path"]).resolve()
+        if not resolved.exists():
+            missing_written.append(f"{w['name']} ({w['file_path']})")
+    if missing_written:
+        console.print(
+            f"[red]decomposer produced {len(written)} subtask(s) but "
+            f"{len(missing_written)} file(s) are missing on disk:[/red] "
+            f"{', '.join(missing_written)}"
+        )
         raise typer.Exit(1)
 
     cfg.task.group = [

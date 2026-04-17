@@ -306,6 +306,15 @@ class TaskSpec:
     decompose_prompt_path: Optional[str] = None
     decompose_model: str = "sonnet"
     decompose_effort: str = "high"
+    # Decomposer asks claude for N × 80-200 lines + a 15-30 line summary,
+    # which Sonnet with effort=high can take 5-10 minutes to generate.
+    # 300s was the old hardcoded cap and timed out in practice once the
+    # prompt started demanding detailed content.
+    decompose_timeout: int = 600
+    # Distilled project vision produced by the decomposer alongside the
+    # subtasks — injected into every subtask objective so agents keep
+    # the project concept in view instead of scoping down to their slice.
+    project_summary: str = ""
 
     deep_think: bool = False
     deep_think_model: str = "opus"
@@ -315,6 +324,13 @@ class TaskSpec:
     deep_think_timeout: int = 600
     deep_think_budget: Optional[float] = None
     deep_think_effort: str = "max"
+    # Leave unrestricted by default — narrow allowlists like
+    # "Read,Glob,Grep,Bash" cause claude -p to exit with empty stdout
+    # (session-init subsystems and hooks need tools outside the list,
+    # and claude gives up silently rather than erroring). The READ-ONLY
+    # rule is enforced via the prompt instead; if claude ignores it and
+    # writes to a side-file, the fallback in tasks/deep_think.py reads
+    # that file rather than treating stdout as empty.
     deep_think_allowed_tools: Optional[str] = None
     group: list[TaskItem] = field(default_factory=list)
 

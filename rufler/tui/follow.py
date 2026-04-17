@@ -256,21 +256,26 @@ class FollowApp(App):
         self.set_interval(POLL_INTERVAL, self._poll_and_update)
 
     def _tail_all(self) -> None:
-        """Read new lines from all log files."""
+        """Read new lines from all log files.
+
+        Uses binary mode so ``self._offsets[key]`` stays a true byte
+        position. Text-mode seek with a byte count desyncs the UTF-8
+        decoder on any multi-byte content (Cyrillic, emojis in claude
+        stream-json), which is why follow eventually stopped picking
+        up new log lines mid-run.
+        """
         for _tname, lp in self._log_sources:
             key = str(lp.resolve())
             if not lp.exists():
                 continue
             try:
-                with open(lp, "r", encoding="utf-8", errors="replace") as f:
+                with open(lp, "rb") as f:
                     f.seek(self._offsets[key])
-                    for line in f:
-                        if not line.endswith("\n"):
+                    for raw in f:
+                        if not raw.endswith(b"\n"):
                             break
-                        self._offsets[key] += len(
-                            line.encode("utf-8", errors="replace")
-                        )
-                        line = line.strip()
+                        self._offsets[key] += len(raw)
+                        line = raw.decode("utf-8", errors="replace").strip()
                         if not line:
                             continue
                         try:

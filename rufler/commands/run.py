@@ -482,6 +482,7 @@ def register(app: typer.Typer, console: Console) -> None:
                             cfg.task.timeout_minutes * 60,
                             con,
                             start_offset=pre_spawn_size,
+                            supervisor_pid=te.pid,
                         )
                         task_rc = log_rc if log_rc is not None else (
                             0 if found else 1

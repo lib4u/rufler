@@ -20,23 +20,68 @@ import yaml
 from .templates import DENY_RULES_PROMPT
 
 DEFAULT_DECOMPOSE_PROMPT = """\
-You are a task decomposer. Split the MAIN TASK below into exactly {n} \
-sequential subtasks. Each subtask must be self-contained, actionable, and \
-buildable on the previous one. Output ONLY valid YAML, no prose, no \
-markdown fences, in this exact shape:
+# DECOMPOSER CONTRACT — READ FIRST
+
+Output YAML directly in your response. Nothing else. No prose, no \
+fences, no preamble, no "here is the plan".
+
+**Do NOT use any tools.** No Glob, Grep, Read, Bash, Write, Task, or \
+any other. The PROJECT ANALYSIS block below is complete — everything \
+you need to plan is already there. Exploring the codebase wastes time \
+and produces nothing. Generate the YAML and return.
+
+## Required shape
+
+```
+project_summary: |
+  15-30 lines distilling: what the project is, stack, key
+  architectural decisions (cite modules from analysis), constraints,
+  what success looks like. Downstream agents read only this block —
+  empty or one-line summaries cause drift.
 
 tasks:
   - name: task_1
-    title: "Short human title"
+    title: "Clear imperative title"
     content: |
-      Full multi-line description of the subtask. What to build, files to \
-touch, acceptance criteria.
-  - name: task_2
-    title: "..."
-    content: |
-      ...
+      ## Scope
+      What this subtask delivers. What it leaves for later. Meaningful
+      unit of work — not a trivial slice.
 
-MAIN TASK:
+      ## Files
+      Concrete paths to create/modify, each with purpose + what
+      changes. Several sentences per important file.
+
+      ## Interfaces
+      Signatures, types, DB shapes, migrations, events. The contract
+      the next subtask relies on.
+
+      ## Implementation notes
+      Algorithms, libraries, patterns, gotchas — pulled from the
+      analysis. Cite file:line. Name real modules. Several paragraphs.
+
+      ## Tests
+      What to add/update, where, unit vs integration, fixtures, edges.
+
+      ## Acceptance criteria
+      6-12 objectively verifiable checklist items ("POST /x returns
+      201 on valid body and 422 on …", not "works correctly").
+
+      ## Dependencies
+      What earlier subtasks this builds on. What downstream consumers
+      need from it.
+  - name: task_2
+    ...
+```
+
+## Constraints
+
+- Exactly {n} subtasks. Sequential.
+- Target 60-150 lines of `content` per task. Thin content ("implement \
+backend", bare file lists) is a failure mode.
+- Cover the MAIN TASK end-to-end. No gaps. No "polish" placeholders.
+- Depth over breadth: prefer fewer deeper tasks over many shallow ones.
+
+MAIN TASK (project analysis is included):
 {main}
 """
 
@@ -73,19 +118,29 @@ def _claude_bin() -> Optional[str]:
 def _extract_yaml(text: str) -> str:
     """Pull a YAML document out of the model's reply.
 
-    1. If there's a ```yaml fenced block, use it.
-    2. Otherwise look for the first line beginning with `tasks:` and take
-       everything from there to the end — the model may prepend prose.
-    3. Fallback: return stripped raw text.
+    Anchors beat fences. When the YAML itself contains fenced code
+    inside a ``content: |`` block (e.g. a directory tree, a code
+    sample), a naive ``re.search(r"```...```")`` grabs the INNER fence
+    and returns a non-YAML payload. So we look for the top-level keys
+    first, and only fall back to a yaml-tagged fence when no anchor is
+    present.
+
+    Order:
+    1. First top-level ``project_summary:`` or ``tasks:`` line — take
+       everything from there to end.
+    2. Otherwise a ```yaml / ```yml tagged fenced block (untagged ```
+       fences are NOT matched — too easy to collide with nested code).
+    3. Otherwise stripped raw text.
     """
     text = text.strip()
-    m = re.search(r"```(?:yaml|yml)?\s*\n(.*?)```", text, re.DOTALL)
+    lines = text.splitlines()
+    for anchor in ("project_summary:", "tasks:"):
+        for i, ln in enumerate(lines):
+            if ln.lstrip().startswith(anchor):
+                return "\n".join(lines[i:]).strip()
+    m = re.search(r"```(?:yaml|yml)\s*\n(.*?)```", text, re.DOTALL)
     if m:
         return m.group(1).strip()
-    lines = text.splitlines()
-    for i, ln in enumerate(lines):
-        if ln.lstrip().startswith("tasks:"):
-            return "\n".join(lines[i:]).strip()
     return text
 
 
@@ -97,9 +152,10 @@ def decompose(
     *,
     model: str = "sonnet",
     effort: str = "high",
+    timeout: int = 600,
     prompt_template: Optional[str] = None,
     log_path: Optional[Path] = None,
-) -> list[dict]:
+) -> dict:
     """Call claude -p, parse YAML, write subtask files + companion yml.
 
     `prompt_template` optionally overrides the built-in decomposer prompt.
@@ -107,7 +163,10 @@ def decompose(
     When *log_path* is given, claude's stream-json output is written to
     the NDJSON log in real time so ``rufler follow`` can show progress.
 
-    Returns the list of parsed subtasks (name, title, content, file_path).
+    Returns ``{"tasks": [...], "project_summary": "..."}``. `tasks` is
+    the list of parsed subtasks (name, title, file_path). `project_summary`
+    is the distilled north-star block the decomposer produces alongside —
+    empty string if the model omitted it.
     """
     claude = _claude_bin()
     if not claude:
@@ -131,10 +190,10 @@ def decompose(
 
     try:
         res = stream_claude(
-            cmd, log_path=log_path, timeout=300, phase="decompose",
+            cmd, log_path=log_path, timeout=timeout, phase="decompose",
         )
     except subprocess.TimeoutExpired as e:
-        raise RuntimeError(f"claude decompose timed out after 300s: {e}") from e
+        raise RuntimeError(f"claude decompose timed out after {timeout}s: {e}") from e
     if res.returncode != 0:
         raise RuntimeError(
             f"claude decompose failed (rc={res.returncode}): {res.stderr[:400]}"
@@ -151,6 +210,12 @@ def decompose(
         raise RuntimeError(
             f"decomposer: expected 'tasks:' list, got: {json.dumps(parsed)[:400]}"
         )
+
+    project_summary = ""
+    if isinstance(parsed, dict):
+        ps_raw = parsed.get("project_summary")
+        if isinstance(ps_raw, str):
+            project_summary = ps_raw.strip()
 
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[dict] = []
@@ -177,18 +242,19 @@ def decompose(
         raise RuntimeError("decomposer: no valid subtasks produced")
 
     # Emit companion yml
-    companion = {
-        "task": {
-            "multi": True,
-            "run_mode": "sequential",
-            "group": [
-                {"name": w["name"], "file_path": w["file_path"]} for w in written
-            ],
-        }
+    task_block: dict = {
+        "multi": True,
+        "run_mode": "sequential",
     }
+    if project_summary:
+        task_block["project_summary"] = project_summary
+    task_block["group"] = [
+        {"name": w["name"], "file_path": w["file_path"]} for w in written
+    ]
+    companion = {"task": task_block}
     yml_path.parent.mkdir(parents=True, exist_ok=True)
     yml_path.write_text(
         yaml.safe_dump(companion, sort_keys=False, allow_unicode=True),
         encoding="utf-8",
     )
-    return written
+    return {"tasks": written, "project_summary": project_summary}

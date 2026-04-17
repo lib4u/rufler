@@ -65,36 +65,50 @@ def restore_permissions(settings_path: Path, previous_mode: str | None) -> None:
     settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-# Deny rules that hide `.rufler/**` from every Claude process spawned in
-# the project (deep_think, decomposer, hive-mind spawn). Written into
-# `.claude/settings.local.json` before any claude invocation so the LLM
-# can't wander into rufler's own logs/registry while working on the user's
-# code. Kept as a module constant so `restore_rufler_ignored` knows
-# exactly which entries to strip on cleanup.
-_RUFLER_IGNORE_PATHS = (".rufler/**", "./.rufler/**", "**/.rufler/**")
+# Deny rules that hide rufler's internal state from every Claude process
+# spawned in the project (deep_think, decomposer, hive-mind spawn, report).
+# Written into `.claude/settings.local.json` before any claude invocation.
+#
+# IMPORTANT: we do NOT block `.rufler/**` wholesale. Claude Code enforces
+# `deny > allow` with no negation, and the report phase must be able to
+# Write into `.rufler/reports/` and `.rufler/report.md`. So we enumerate
+# the specific noisy/state subpaths and leave report outputs open.
+_RUFLER_IGNORE_SUBPATHS = (
+    "logs/**",         # logwriter output dir (if used)
+    "tasks/**",        # decomposed task files + companion yml
+    "analysis.md",     # deep_think output
+    "run.log",         # primary run log
+    "*.log",           # per-task logs
+    "*.ndjson",        # raw stream-json captures
+    # Intentionally NOT blocked: reports/**, report.md — these are
+    # legitimate write targets for the report phase.
+)
+_RUFLER_IGNORE_PREFIXES = (".rufler", "./.rufler", "**/.rufler")
 _RUFLER_FILE_TOOLS = (
     "Read", "Edit", "Write", "MultiEdit", "Glob", "Grep", "NotebookEdit",
 )
+# Bash prefixes target log-inspection patterns specifically — the report
+# phase doesn't need these, and narrow Bash denies don't interfere with
+# Write/Edit on .rufler/reports/.
 _RUFLER_BASH_PREFIXES = (
-    "ls .rufler", "ls ./.rufler",
-    "cat .rufler", "cat ./.rufler",
-    "tail .rufler", "tail ./.rufler", "tail -f .rufler", "tail -f ./.rufler",
-    "head .rufler", "head ./.rufler",
-    "less .rufler", "less ./.rufler",
-    "cd .rufler", "cd ./.rufler",
-    "find .rufler", "find ./.rufler",
-    "tree .rufler", "tree ./.rufler",
-    "grep .rufler", "rg .rufler",
+    "tail .rufler/run.log", "tail -f .rufler/run.log",
+    "tail .rufler/logs", "tail -f .rufler/logs",
+    "cat .rufler/run.log",
+    "cat .rufler/logs",
+    "less .rufler/run.log", "less .rufler/logs",
+    "head .rufler/run.log", "head .rufler/logs",
 )
 
 
 def _rufler_deny_rules() -> list[str]:
     rules: list[str] = []
-    for tool in _RUFLER_FILE_TOOLS:
-        for pat in _RUFLER_IGNORE_PATHS:
-            rules.append(f"{tool}({pat})")
-    for prefix in _RUFLER_BASH_PREFIXES:
-        rules.append(f"Bash({prefix}:*)")
+    for sub in _RUFLER_IGNORE_SUBPATHS:
+        for prefix in _RUFLER_IGNORE_PREFIXES:
+            pat = f"{prefix}/{sub}"
+            for tool in _RUFLER_FILE_TOOLS:
+                rules.append(f"{tool}({pat})")
+    for bash in _RUFLER_BASH_PREFIXES:
+        rules.append(f"Bash({bash}:*)")
     return rules
 
 

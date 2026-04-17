@@ -22,21 +22,21 @@ class TestBuildDeepThinkPrompt:
         # DENY_RULES_PROMPT is always prepended, so `out` ends with the
         # rendered template rather than equalling it.
         assert out.endswith("Analyze this: my task\nDone.")
-        assert "IGNORE RUFLER INFRASTRUCTURE" in out
+        assert "PATH-ACCESS POLICY" in out
 
     def test_custom_template_without_placeholder(self):
         tpl = "Just analyze the project."
         out = build_deep_think_prompt("my task", template=tpl)
         assert "my task" in out
         assert "TASK TO ANALYZE" in out
-        assert "IGNORE RUFLER INFRASTRUCTURE" in out
+        assert "PATH-ACCESS POLICY" in out
 
     def test_deny_rules_always_prepended(self):
         out_default = build_deep_think_prompt("task")
         out_custom = build_deep_think_prompt("task", template="x {main}")
         out_no_placeholder = build_deep_think_prompt("task", template="y")
         for out in (out_default, out_custom, out_no_placeholder):
-            assert "IGNORE RUFLER INFRASTRUCTURE" in out
+            assert "PATH-ACCESS POLICY" in out
             assert ".rufler/" in out
             assert "rufler_flow.yml" in out
 

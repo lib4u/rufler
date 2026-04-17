@@ -27,24 +27,45 @@ if TYPE_CHECKING:
     from ..config import FlowConfig
 
 DEFAULT_TASK_REPORT_PROMPT = """\
+# YOUR SINGLE JOB
+
+Use the **Write** tool to create the Markdown report at this absolute path:
+
+    {report_path}
+
+Do not skip the Write call. Do not ask for confirmation. Do not return \
+the report inline — rufler reads it from the file you write.
+
+---
+
 You are a technical report writer. Task '{task_name}' has just completed \
 for project '{project}'.
 
-Analyze the changes made during this task and write a brief completion report.
+Analyze the changes made during this task and write a brief completion \
+report covering:
 
-Include:
 1. WHAT WAS DONE — concrete changes, files created or modified
 2. DECISIONS — key architectural or design choices made
 3. STATUS — is the task fully complete or are there loose ends?
 
-Read shared memory namespace '{ns}' for context (keys: progress, \
-decisions, blockers, checkpoint:latest).
+Read shared memory namespace '{ns}' for context if helpful (keys: \
+progress, decisions, blockers, checkpoint:latest).
 
-Write the report as Markdown to: {report_path}
-Keep it concise — 1 page max. Do NOT ask for confirmation.
+Keep the report concise — 1 page of Markdown is plenty.
 """
 
 DEFAULT_FINAL_REPORT_PROMPT = """\
+# YOUR SINGLE JOB
+
+Use the **Write** tool to create the Markdown report at this absolute path:
+
+    {report_path}
+
+Do not skip the Write call. Do not ask for confirmation. Do not return \
+the report inline — rufler reads it from the file you write.
+
+---
+
 You are a technical report writer. All tasks have completed for project \
 '{project}'.
 
@@ -57,9 +78,6 @@ Include:
 3. KEY DECISIONS — architectural and design choices
 4. FILES CHANGED — list of created/modified files with brief descriptions
 5. REMAINING WORK — known TODOs, blockers, or incomplete items
-
-Write the report as Markdown to: {report_path}
-Do NOT ask for confirmation.
 """
 
 
@@ -123,6 +141,11 @@ def run_report(
     label = "final report" if is_final else f"report ({task_name})"
     console.print(f"[dim]generating {label} → {report_path}[/dim]")
 
+    # Claude's Write tool expects absolute paths — passing a relative
+    # path like '.rufler/reports/task_1.md' into the prompt sometimes
+    # produces a Write call that fails silently or writes to the wrong
+    # cwd. Use the absolute resolved path in the prompt so there's no
+    # ambiguity about where the report lands.
     prompt = _resolve_prompt(
         spec,
         cfg.base_dir,
@@ -130,7 +153,7 @@ def run_report(
         task_name=task_name,
         project=cfg.project.name,
         ns=cfg.memory.namespace,
-        report_path=report_path,
+        report_path=str(abs_report),
     )
 
     log_suffix = "report" if is_final else f"{task_name}.report"
@@ -174,6 +197,18 @@ def run_report(
         console.print(f"[yellow]{label} failed:[/yellow] [dim]{e}[/dim]")
         task_rc = 1
 
+    # Verify claude actually wrote the report file. rc=0 only means the
+    # subprocess exited cleanly; claude can finish without using Write.
+    # Without this check we'd print "[green] written" while the file
+    # doesn't exist, and downstream chain-retrospective / final-report
+    # steps would silently skip missing reports.
+    if task_rc == 0 and not abs_report.exists():
+        console.print(
+            f"[yellow]{label}: claude exited rc=0 but {abs_report} is missing — "
+            f"marking as failed[/yellow]"
+        )
+        task_rc = 1
+
     te.finished_at = time.time()
     te.rc = task_rc
     emit_task_marker(
@@ -183,6 +218,10 @@ def run_report(
     registry.update(reg_entry)
 
     if task_rc == 0:
-        console.print(f"[green]{label} written[/green] → {report_path}")
+        size = abs_report.stat().st_size if abs_report.exists() else 0
+        console.print(
+            f"[green]{label} written[/green] → {report_path} "
+            f"[dim]({size} bytes)[/dim]"
+        )
     else:
         console.print(f"[yellow]{label} finished with rc={task_rc}[/yellow]")

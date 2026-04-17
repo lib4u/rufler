@@ -30,6 +30,29 @@ from .models import (
 from ..templates import DENY_RULES_PROMPT
 
 
+# Cap the raw main-task body we inject into every subtask's objective.
+# task.main can occasionally be a huge spec document — injecting the
+# full thing into N subtask prompts balloons tokens linearly with N.
+# 1000 lines is generous (most mains are <100) while being a safety
+# valve for pathological inputs.
+_MAIN_TASK_LINE_CAP = 1000
+
+
+def _truncate_main_task(text: str, cap: int = _MAIN_TASK_LINE_CAP) -> str:
+    """Return *text* trimmed to at most *cap* lines, with a one-line
+    marker appended when truncation happens. Frontloaded: we keep the
+    head because task specs put intent first and acceptance last —
+    agents can still rely on chain retrospectives + analysis for the
+    tail."""
+    lines = text.splitlines()
+    if len(lines) <= cap:
+        return text
+    dropped = len(lines) - cap
+    kept = lines[:cap]
+    kept.append(f"[... {dropped} more line(s) truncated — full spec at task.main / main_path ...]")
+    return "\n".join(kept)
+
+
 # --------------- Parse helpers ---------------
 
 def _task_item_from_dict(name: str, item: dict) -> TaskItem:
@@ -297,6 +320,40 @@ class FlowConfig:
         if self.project.description:
             lines.append(self.project.description.strip())
         lines.append("")
+
+        # The decomposer produces a distilled project_summary alongside
+        # subtasks — inject it before the full analysis so every agent
+        # sees the project's north star at the top, not buried under the
+        # deep-think dump. Applies to multi-task runs with decompose=true
+        # and also to any flow where the user sets task.project_summary
+        # directly in yml.
+        if self.task.project_summary:
+            lines.append("# PROJECT VISION (shared north-star for every subtask)")
+            lines.append(self.task.project_summary.strip())
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+        # Raw original main task — subtasks run against the decomposer's
+        # slice, but nuance in the user's raw intent doesn't always
+        # survive distillation. Inject the full main body (capped) into
+        # every subtask objective so agents can cross-check their slice
+        # against the user's actual words. Only in multi-task mode —
+        # mono mode already carries task.main as the TASK body below.
+        if self.task.multi:
+            try:
+                raw_main = self.task.resolved_main(self.base_dir)
+            except FileNotFoundError:
+                raw_main = (self.task.main or "").strip()
+            if raw_main:
+                lines.append(
+                    "# ORIGINAL MAIN TASK "
+                    "(user's raw intent — your subtask is one slice of this)"
+                )
+                lines.append(_truncate_main_task(raw_main.strip()))
+                lines.append("")
+                lines.append("---")
+                lines.append("")
 
         if analysis:
             lines.append("# PROJECT ANALYSIS (from deep_think phase — read-only context)")

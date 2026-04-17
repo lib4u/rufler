@@ -394,6 +394,307 @@ def test_depends_on_injects_gate_and_handoff(tmp_path: Path):
     assert "instructions:t1:architect->coder" not in obj_t2
 
 
+def test_project_summary_in_objective(tmp_path: Path):
+    """project_summary is injected above the deep_think analysis so
+    every subtask sees the project's north star at the top."""
+    from rufler.config import FlowConfig
+    p = _write_flow_yml(tmp_path,
+        "  - {name: a, type: coder, role: worker, seniority: junior, prompt: 'x'}\n"
+    )
+    cfg = FlowConfig.load(p)
+    cfg.task.project_summary = (
+        "# The idea\nBuild a REST API in FastAPI.\nStack: Python 3.11, "
+        "Postgres, SQLAlchemy.\nSuccess: /users endpoints pass the smoke "
+        "suite."
+    )
+    obj = cfg.build_objective(
+        task_body="implement POST /users",
+        task_name="task_1",
+        analysis="## 1. Project Overview\nFresh repo, no code yet.",
+    )
+    vision_idx = obj.find("# PROJECT VISION")
+    analysis_idx = obj.find("# PROJECT ANALYSIS")
+    task_idx = obj.find("# TASK: task_1")
+    # Vision comes before analysis and task body
+    assert 0 < vision_idx < analysis_idx < task_idx
+    assert "Build a REST API in FastAPI" in obj
+    assert "Success: /users endpoints" in obj
+
+
+def test_original_main_injected_in_multi_mode(tmp_path: Path):
+    """In multi-task mode every subtask objective carries the raw
+    `task.main` so the agent can see the user's original intent, not
+    just the decomposer's distilled slice."""
+    from rufler.config import FlowConfig, TaskItem
+
+    p = tmp_path / "rufler_flow.yml"
+    p.write_text(
+        "project:\n  name: multi-proj\n"
+        "task:\n"
+        "  main: |\n"
+        "    Build a REST API for users.\n"
+        "    Must support JWT auth.\n"
+        "    Postgres backend.\n"
+        "  multi: true\n"
+        "agents:\n"
+        "  - {name: a, type: coder, role: worker, seniority: junior, prompt: x}\n",
+        encoding="utf-8",
+    )
+    cfg = FlowConfig.load(p)
+    cfg.task.group = [TaskItem(name="task_1", file_path="x.md")]
+
+    obj = cfg.build_objective(task_body="scaffold app", task_name="task_1")
+    assert "# ORIGINAL MAIN TASK" in obj
+    assert "Build a REST API for users." in obj
+    assert "Must support JWT auth." in obj
+    # Subtask body still rendered under TASK block
+    assert "# TASK: task_1" in obj
+    assert "scaffold app" in obj
+
+
+def test_original_main_skipped_in_mono_mode(tmp_path: Path):
+    """Mono-mode objectives already render `task.main` as the TASK body;
+    injecting it a second time via ORIGINAL MAIN TASK would duplicate."""
+    from rufler.config import FlowConfig
+    p = tmp_path / "rufler_flow.yml"
+    p.write_text(
+        "project:\n  name: mono-proj\n"
+        "task:\n  main: 'single task body'\n"
+        "agents:\n"
+        "  - {name: a, type: coder, role: worker, seniority: junior, prompt: x}\n",
+        encoding="utf-8",
+    )
+    cfg = FlowConfig.load(p)
+    obj = cfg.build_objective()
+    assert "ORIGINAL MAIN TASK" not in obj
+
+
+def test_original_main_truncated_at_cap(tmp_path: Path):
+    """Oversized task.main is capped to 1000 lines with a truncation
+    marker so every subtask prompt doesn't balloon."""
+    from rufler.config import FlowConfig, TaskItem
+
+    main_body = "\n".join(f"line {i}" for i in range(1500))
+    p = tmp_path / "rufler_flow.yml"
+    p.write_text(
+        "project:\n  name: big\n"
+        "task:\n  main: |\n"
+        + "\n".join(f"    line {i}" for i in range(1500)) + "\n"
+        + "  multi: true\n"
+        "agents:\n"
+        "  - {name: a, type: coder, role: worker, seniority: junior, prompt: x}\n",
+        encoding="utf-8",
+    )
+    cfg = FlowConfig.load(p)
+    cfg.task.group = [TaskItem(name="task_1", file_path="x.md")]
+    obj = cfg.build_objective(task_body="slice", task_name="task_1")
+    assert "line 0" in obj
+    assert "line 999" in obj
+    # Line 1000 must be truncated out
+    assert "line 1000" not in obj
+    assert "line(s) truncated" in obj
+
+
+def test_decompose_timeout_default_and_plumbing(tmp_path: Path):
+    """Decompose timeout defaults to 600s (was 300s, caused production
+    hangs on 5 × 80-200 line outputs) and is passed through from yml."""
+    from unittest.mock import patch, MagicMock
+    from rufler.config import TaskSpec
+    from rufler.decomposer import decompose
+
+    assert TaskSpec().decompose_timeout == 600
+
+    stdout = """\
+project_summary: |
+  ok
+tasks:
+  - name: task_1
+    title: "x"
+    content: |
+      Do thing.
+"""
+    mock_res = MagicMock()
+    mock_res.returncode = 0
+    mock_res.stdout = stdout
+
+    captured: dict = {}
+    def _capture(cmd, *, log_path=None, timeout=None, phase=None):
+        captured["timeout"] = timeout
+        return mock_res
+
+    with patch("rufler.decomposer._claude_bin", return_value="/usr/bin/claude"), \
+         patch("rufler.stream_log.stream_claude", side_effect=_capture):
+        decompose("x", 1, tmp_path / "t", tmp_path / "d.yml", timeout=900)
+
+    assert captured["timeout"] == 900
+
+
+def test_deep_think_allowed_tools_default_unrestricted():
+    """Deep_think leaves allowed_tools unrestricted by default.
+
+    An earlier attempt restricted this to 'Read,Glob,Grep,Bash' to
+    force read-only, but narrow allowlists cause claude -p to exit
+    with empty stdout (session init / hooks need tools outside the
+    list). Enforcement now lives in the prompt + a side-file fallback
+    in tasks/deep_think.py."""
+    from rufler.config import TaskSpec
+    assert TaskSpec().deep_think_allowed_tools is None
+
+
+def test_deep_think_prompt_output_contract_at_top():
+    """The no-file-writes instruction lives at the very top of the
+    prompt (before the persona / rules), not buried in a later Rules
+    block — that's where models pay most attention."""
+    from rufler.tasks.deep_think import build_deep_think_prompt
+
+    out = build_deep_think_prompt("t")
+    # OUTPUT CONTRACT appears before the persona intro
+    contract_idx = out.find("OUTPUT CONTRACT")
+    persona_idx = out.find("senior software architect")
+    rules_idx = out.find("## Rules")
+    assert contract_idx != -1 and persona_idx != -1 and rules_idx != -1
+    assert contract_idx < persona_idx < rules_idx
+    # The contract body explicitly forbids file writes
+    contract = out[contract_idx:persona_idx]
+    for forbidden in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        assert forbidden in contract
+    assert "directly in your response" in contract.lower()
+
+
+def test_project_summary_absent_omits_section(tmp_path: Path):
+    from rufler.config import FlowConfig
+    p = _write_flow_yml(tmp_path,
+        "  - {name: a, type: coder, role: worker, seniority: junior, prompt: 'x'}\n"
+    )
+    cfg = FlowConfig.load(p)
+    # Default project_summary is "" — must not emit an empty vision block
+    obj = cfg.build_objective(task_body="do thing", task_name="t")
+    assert "PROJECT VISION" not in obj
+
+
+def test_decomposer_parses_project_summary(tmp_path: Path):
+    """End-to-end: claude returns YAML with project_summary + tasks;
+    decompose() writes it to companion yml and returns it."""
+    from unittest.mock import patch, MagicMock
+    from rufler.decomposer import decompose
+
+    stdout = """\
+project_summary: |
+  # North star
+  Build a REST API. Stack: FastAPI, Postgres.
+  Success: /users + /auth live.
+tasks:
+  - name: task_1
+    title: "Scaffold app"
+    content: |
+      ## Scope
+      Create FastAPI skeleton.
+      ## Files
+      app/main.py — entry point.
+      ## Acceptance
+      - `uvicorn app.main:app` boots.
+  - name: task_2
+    title: "Add DB"
+    content: |
+      ## Scope
+      Wire Postgres via SQLAlchemy.
+      ## Files
+      app/db.py — engine + session.
+      ## Acceptance
+      - Connection health check passes.
+"""
+    mock_res = MagicMock()
+    mock_res.returncode = 0
+    mock_res.stdout = stdout
+    out_dir = tmp_path / "tasks"
+    yml_out = tmp_path / "decomposed_tasks.yml"
+
+    with patch("rufler.decomposer._claude_bin", return_value="/usr/bin/claude"), \
+         patch("rufler.stream_log.stream_claude", return_value=mock_res):
+        result = decompose("big task", 2, out_dir, yml_out)
+
+    assert set(result.keys()) == {"tasks", "project_summary"}
+    assert "Build a REST API" in result["project_summary"]
+    assert len(result["tasks"]) == 2
+
+    import yaml as _yaml
+    saved = _yaml.safe_load(yml_out.read_text(encoding="utf-8"))
+    assert "Build a REST API" in saved["task"]["project_summary"]
+    assert len(saved["task"]["group"]) == 2
+
+
+def test_decomposer_anchors_beat_nested_fences(tmp_path: Path):
+    """Regression: claude's YAML output can contain fenced code blocks
+    (directory trees, code samples) inside `content: |` values. Naive
+    `re.search(r'```...```')` grabs the INNER fence and returns a
+    non-YAML payload. _extract_yaml must prefer the top-level
+    project_summary/tasks anchor over any nested fence."""
+    from unittest.mock import patch, MagicMock
+    from rufler.decomposer import decompose
+
+    # Mock a realistic claude reply: YAML with a nested tree fence
+    # inside project_summary (real failure mode observed in prod).
+    stdout = '''\
+project_summary: |
+  A greenfield project.
+  Structure:
+  ```
+  my-app/
+  ├── src/
+  └── tests/
+  ```
+  Stack: Next.js + TypeScript.
+tasks:
+  - name: task_1
+    title: "Scaffold"
+    content: |
+      ## Scope
+      Initial scaffold.
+      ## Files
+      src/index.ts — entry point.
+  - name: task_2
+    title: "Implement"
+    content: |
+      ## Scope
+      Implement core.
+'''
+    mock_res = MagicMock(returncode=0, stdout=stdout, stderr="")
+    with patch("rufler.decomposer._claude_bin", return_value="/usr/bin/claude"), \
+         patch("rufler.stream_log.stream_claude", return_value=mock_res):
+        result = decompose("x", 2, tmp_path / "t", tmp_path / "d.yml")
+
+    assert len(result["tasks"]) == 2
+    assert "A greenfield project" in result["project_summary"]
+    # The tree fence inside project_summary survived as-is in the value
+    assert "└── tests/" in result["project_summary"]
+
+
+def test_decomposer_missing_project_summary_tolerated(tmp_path: Path):
+    """If the model omits project_summary, decompose() still returns the
+    tasks and sets project_summary to empty string — the caller warns
+    but doesn't fail."""
+    from unittest.mock import patch, MagicMock
+    from rufler.decomposer import decompose
+
+    stdout = """\
+tasks:
+  - name: task_1
+    title: "x"
+    content: |
+      Do thing.
+"""
+    mock_res = MagicMock()
+    mock_res.returncode = 0
+    mock_res.stdout = stdout
+
+    with patch("rufler.decomposer._claude_bin", return_value="/usr/bin/claude"), \
+         patch("rufler.stream_log.stream_claude", return_value=mock_res):
+        result = decompose("x", 1, tmp_path / "tasks", tmp_path / "dec.yml")
+
+    assert result["project_summary"] == ""
+    assert len(result["tasks"]) == 1
+
+
 def test_depends_on_null_normalizes_to_empty(tmp_path: Path):
     from rufler.config import FlowConfig
     p = _write_flow_yml(tmp_path,
@@ -1205,6 +1506,153 @@ def test_decompose_reuses_existing_files(tmp_path: Path):
     assert cfg.task.group[1].name == "task_2"
 
 
+def test_wait_for_log_end_detects_dead_supervisor(tmp_path: Path):
+    """Regression: claude/logwriter can die via SIGKILL (OOM, terminal
+    close) without writing the 'log ended rc=N' marker. If the
+    supervisor pid is dead AND the log stopped growing, bail out of the
+    wait — otherwise rufler sits on a corpse for the full task
+    timeout (up to 4h by default)."""
+    from rufler.process.daemon import wait_for_log_end
+
+    log = tmp_path / "task.log"
+    log.write_text("some content\nbut no 'log ended' marker\n", encoding="utf-8")
+
+    class StubConsole:
+        def __init__(self): self.messages = []
+        def print(self, *a, **kw): self.messages.append(a)
+
+    stub = StubConsole()
+    # PID 1 (init) is alive on any POSIX system, but we want a DEAD pid.
+    # 0 is reserved + _pid_alive treats non-positive as dead.
+    dead_pid = 0
+
+    import time as _time
+    start = _time.time()
+    found, rc = wait_for_log_end(
+        log, timeout_sec=60, console=stub,
+        start_offset=0,
+        supervisor_pid=dead_pid,
+        stale_threshold_sec=1,  # bail quickly for test
+    )
+    elapsed = _time.time() - start
+
+    assert found is False
+    assert rc is None
+    # Must have bailed quickly — well under the 60s timeout
+    assert elapsed < 10, f"waited {elapsed:.1f}s — early-bail didn't fire"
+    joined = " ".join(str(m) for m in stub.messages)
+    assert "supervisor" in joined and "gone" in joined
+
+
+def test_decompose_cache_partial_files_regenerates(tmp_path: Path):
+    """Cache validation: if yml lists N subtasks but only M (< N) files
+    exist on disk, the cache is considered invalid and rufler triggers
+    regeneration instead of silently proceeding with a truncated list."""
+    import yaml as _yaml
+    from unittest.mock import patch
+    from rufler.config import FlowConfig, TaskSpec
+
+    tasks_dir = tmp_path / ".rufler" / "tasks"
+    tasks_dir.mkdir(parents=True)
+    # Only task_1 exists; task_2 / task_3 are listed in yml but missing
+    (tasks_dir / "task_1.md").write_text("# task_1\n", encoding="utf-8")
+
+    yml_out = tasks_dir / "decomposed_tasks.yml"
+    companion = {"task": {"multi": True, "run_mode": "sequential",
+                          "group": [
+                              {"name": "task_1", "file_path": "task_1.md"},
+                              {"name": "task_2", "file_path": "task_2.md"},
+                              {"name": "task_3", "file_path": "task_3.md"},
+                          ]}}
+    yml_out.write_text(_yaml.safe_dump(companion), encoding="utf-8")
+
+    cfg = FlowConfig()
+    cfg.base_dir = tmp_path
+    cfg.task = TaskSpec(
+        main="big task",
+        multi=True,
+        decompose=True,
+        decompose_file=".rufler/tasks/decomposed_tasks.yml",
+        decompose_dir=".rufler/tasks",
+    )
+
+    class StubConsole:
+        def __init__(self):
+            self.messages: list = []
+        def rule(self, *a, **kw): self.messages.append(("rule", a, kw))
+        def print(self, *a, **kw): self.messages.append(("print", a, kw))
+
+    stub = StubConsole()
+    from rufler.run_steps import decompose_task_group
+    from click.exceptions import Exit
+    # `_claude_bin` stubbed so the fresh decompose attempt fails
+    # deterministically — we only care that regeneration was TRIGGERED,
+    # not that it succeeded.
+    with patch("rufler.decomposer._claude_bin", return_value=None):
+        with pytest.raises(Exit):
+            decompose_task_group(cfg, stub, force_new=False)
+
+    # Message about cache-invalidation must have been printed
+    joined = " ".join(str(m) for m in stub.messages)
+    assert "cache invalid" in joined or "regenerating" in joined
+    assert "missing" in joined.lower() or "subtask" in joined.lower()
+
+
+def test_decompose_retries_on_parse_failure(tmp_path: Path):
+    """On decomposer parse failure the CLI retries once before failing."""
+    from unittest.mock import patch, MagicMock
+    from rufler.config import FlowConfig, TaskSpec
+
+    cfg = FlowConfig()
+    cfg.base_dir = tmp_path
+    cfg.task = TaskSpec(
+        main="x",
+        multi=True,
+        decompose=True,
+        decompose_count=1,
+        decompose_file=".rufler/tasks/decomposed_tasks.yml",
+        decompose_dir=".rufler/tasks",
+    )
+
+    class StubConsole:
+        def __init__(self):
+            self.messages: list = []
+        def rule(self, *a, **kw): self.messages.append(a)
+        def print(self, *a, **kw): self.messages.append(a)
+
+    stub = StubConsole()
+    from rufler.run_steps import decompose_task_group
+    from click.exceptions import Exit
+
+    # First call raises, second call returns valid result.
+    good_stdout = '''\
+project_summary: |
+  ok
+tasks:
+  - name: task_1
+    title: "x"
+    content: |
+      Do it.
+'''
+    mock_good = MagicMock(returncode=0, stdout=good_stdout, stderr="")
+    call_count = {"n": 0}
+    def flaky(cmd, *, log_path=None, timeout=None, phase=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Simulate invalid YAML -> decompose raises RuntimeError
+            return MagicMock(returncode=0, stdout="not yaml at all", stderr="")
+        return mock_good
+
+    with patch("rufler.decomposer._claude_bin", return_value="/usr/bin/claude"), \
+         patch("rufler.stream_log.stream_claude", side_effect=flaky):
+        decompose_task_group(cfg, stub, force_new=False)
+
+    assert call_count["n"] == 2, f"expected 2 attempts, got {call_count['n']}"
+    assert len(cfg.task.group) == 1
+    joined = " ".join(str(m) for m in stub.messages)
+    assert "retry" in joined.lower()
+
+
 def test_decompose_ignores_existing_when_force_new(tmp_path: Path):
     """With force_new=True, decompose should NOT reuse files and should
     invoke the decomposer instead. We mock out `claude` so the call is
@@ -1460,3 +1908,67 @@ def test_report_prompt_resolution():
     )
     assert "myapp" in result_default
     assert "report" in result_default.lower()
+
+
+def test_report_default_prompt_demands_write_tool():
+    """Report prompts must explicitly tell claude to call the Write
+    tool at the absolute path — otherwise claude sometimes returns the
+    markdown inline, leaving no file on disk."""
+    from rufler.tasks.report import (
+        DEFAULT_TASK_REPORT_PROMPT, DEFAULT_FINAL_REPORT_PROMPT,
+    )
+    for tpl in (DEFAULT_TASK_REPORT_PROMPT, DEFAULT_FINAL_REPORT_PROMPT):
+        assert "Write" in tpl
+        assert "absolute path" in tpl
+        # No ambiguous "respond with" / "return the report" instruction
+        assert "return the report inline" in tpl.lower() or "not return" in tpl.lower()
+
+
+def test_run_report_marks_failed_when_file_missing(tmp_path: Path):
+    """Regression: rc=0 from the claude subprocess does NOT prove the
+    report was written. Without the file-exists check, run_report
+    used to print '[green] written' while the report file was missing,
+    causing chain retrospectives and final reports to silently skip."""
+    from unittest.mock import MagicMock
+    from rufler.tasks.report import run_report
+    from rufler.config import FlowConfig, ReportSpec
+
+    cfg = FlowConfig()
+    cfg.base_dir = tmp_path
+    cfg.project.name = "p"
+
+    class StubRunner:
+        def hive_spawn_claude(self, **_):
+            # Simulate claude exiting cleanly WITHOUT writing the file
+            return 0
+
+    from rufler.registry import RunEntry
+    reg_entry = RunEntry(
+        id="abc", project="p", flow_file="f", base_dir=str(tmp_path),
+        mode="fg", run_mode="seq", started_at=1.0,
+    )
+
+    class StubRegistry:
+        def __init__(self): self.updates = 0
+        def update(self, e): self.updates += 1
+
+    class StubConsole:
+        def __init__(self): self.messages = []
+        def print(self, *a, **kw): self.messages.append(str(a))
+
+    class StubEff:
+        from pathlib import Path as _P
+        log_file = _P(".rufler/run.log")
+
+    spec = ReportSpec(report=True, report_path=".rufler/reports/{task}.md")
+    stub_con = StubConsole()
+    run_report(
+        cfg, StubRunner(), reg_entry, StubRegistry(), StubEff(),
+        stub_con, spec=spec, task_name="task_1", source="task_report",
+    )
+    # The last appended task entry is the report — rc must be 1
+    te = reg_entry.tasks[-1]
+    assert te.rc == 1, f"expected rc=1 when report file missing, got {te.rc}"
+    # Message must have called out the missing file
+    joined = " ".join(stub_con.messages)
+    assert "missing" in joined.lower()

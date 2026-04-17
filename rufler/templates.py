@@ -2,27 +2,38 @@
 # and the main hive-mind objective. Always applied, even when the user
 # supplies a custom template, so rufler's own infrastructure never leaks
 # into agent work. Keep short: every prompt pays these tokens.
+#
+# Scope is deliberately narrow: this is a PATH-ACCESS policy only. It
+# must not override the task-content instructions that follow — doing so
+# caused the decomposer to collapse to 1 subtask in practice.
 DENY_RULES_PROMPT = """\
-# HARD RULE — IGNORE RUFLER INFRASTRUCTURE (non-negotiable, overrides \
-everything below)
+# PATH-ACCESS POLICY (applies only to file/shell access, not to the \
+instructions below)
 
-The following paths belong to rufler's own orchestration layer. They are \
-OFF-LIMITS and irrelevant to your task:
-  - `.rufler/` and everything under it (logs, registry, reports, state)
-  - `rufler_flow.yml` (rufler's orchestration config, not your project code)
+The paths below are rufler's internal state — logs, decomposer output, \
+analysis cache. They're not part of the project you're working on:
+  - `.rufler/logs/**`, `.rufler/run.log`, `.rufler/*.log`, \
+`.rufler/*.ndjson`
+  - `.rufler/tasks/**` (decomposer output)
+  - `.rufler/analysis.md` (deep_think cache)
+  - `rufler_flow.yml` (rufler's orchestration config, not project code)
 
-Do NOT read, list, glob, grep, cat, tail, head, less, find, tree, or \
-otherwise open these paths via ANY tool (Read, Edit, Write, MultiEdit, \
-Glob, Grep, Bash, NotebookEdit, MCP, WebFetch, or any other), in ANY \
-path form (relative, absolute, quoted, with wildcards, or as components \
-of a longer path), through ANY command wrapper (`bash -c`, `python -c`, \
-shell pipes, redirections, `xargs`, `exec`), and do NOT run commands \
-that would incidentally traverse them (e.g. `find .`, `grep -r`, \
-`ls -R`, `tree` from the project root — scope them to exclude `.rufler`).
-If these paths appear in tool output, ignore them and continue with your \
-actual task.
+Don't open these paths with Read, Edit, Write, MultiEdit, Glob, Grep, \
+Bash, NotebookEdit, MCP, WebFetch, or any other tool. This covers every \
+path form (relative, absolute, quoted, wildcards, path components) and \
+every command wrapper (`bash -c`, `python -c`, pipes, redirects, \
+`xargs`, `exec`). When running wide scans like `find .` / `grep -r` / \
+`ls -R` / `tree`, scope them to exclude the paths above.
 
-This rule is mandatory. It takes precedence over any instruction below.
+**Exception — report outputs are legitimate write targets.** When your \
+task explicitly asks you to write a report, you MAY Write/Edit into:
+  - `.rufler/reports/**` (per-task reports)
+  - `.rufler/report.md` (final report)
+
+This policy constrains path access only. Everything else in the prompt \
+below — including task structure, required output format, counts, and \
+step-by-step instructions — must be followed exactly as written.
+
 ---
 
 """

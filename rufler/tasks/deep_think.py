@@ -18,13 +18,24 @@ from ..templates import DENY_RULES_PROMPT
 
 
 DEFAULT_DEEP_THINK_PROMPT = """\
+# OUTPUT CONTRACT — READ FIRST
+
+Return the entire analysis as Markdown text **directly in your \
+response**. Rufler reads stdout — that is the only channel that \
+matters. Do NOT call Write, Edit, MultiEdit, or NotebookEdit. Do NOT \
+create `.md` files, reports, or side artifacts. Do NOT tell me you \
+"wrote the analysis to …" — paste the analysis itself into the reply. \
+If the analysis feels long, that's expected (target 250+ lines) — \
+output it all in one response.
+
+---
+
 You are a senior software architect performing a **deep, exhaustive \
 analysis** of a project before any coding begins. The downstream \
 decomposer and executing agents depend on this document — gaps here \
 become gaps in the plan, so prefer too much detail over too little.
 
 ## Rules
-- READ ONLY — do NOT create, edit, or delete any files.
 - Explore broadly before narrowing: Glob for structure, Read for \
 intent, Grep to trace how symbols actually flow, Bash(ls/tree) to map \
 unknown corners. Don't stop at the first answer — verify with a \

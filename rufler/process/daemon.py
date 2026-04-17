@@ -17,7 +17,7 @@ import typer
 from rich.console import Console
 
 from ..config import FlowConfig
-from ..registry import Registry, RunEntry
+from ..registry import Registry, RunEntry, _pid_alive
 
 DEFAULT_FLOW_FILE = "rufler_flow.yml"
 DEFAULT_LOG_REL = Path(".rufler") / "run.log"
@@ -142,21 +142,34 @@ def wait_for_log_end(
     console: Console,
     *,
     start_offset: int = 0,
+    supervisor_pid: Optional[int] = None,
+    stale_threshold_sec: int = 180,
 ) -> tuple[bool, Optional[int]]:
     """Poll log_path for the logwriter's 'log ended' marker, only scanning
     bytes ADDED after `start_offset`. This avoids false positives from stale
     'log ended' lines left over from a previous run.
 
+    If *supervisor_pid* is provided and its process is no longer alive AND
+    the log hasn't grown for `stale_threshold_sec` seconds, we bail out
+    early — this catches the case where the claude/logwriter process
+    dies via SIGKILL (OOM, closed terminal, external kill) without
+    writing the cleanup marker. Without this, rufler would patiently
+    wait for the full task timeout (often hours) on a corpse.
+
     Returns (found, rc): found=True when end-marker is detected, rc is the
-    exit code parsed from ``log ended rc=N`` (None if unparsable or timed out).
+    exit code parsed from ``log ended rc=N`` (None if unparsable, timed out,
+    or supervisor died without writing it).
     """
     deadline = time.time() + timeout_sec
     last_size = start_offset
+    last_size_change = time.time()
     warned = False
     while time.time() < deadline:
         if log_path.exists():
             try:
                 size = log_path.stat().st_size
+                if size != last_size:
+                    last_size_change = time.time()
                 if size > last_size:
                     with open(log_path, "rb") as f:
                         f.seek(last_size)
@@ -187,5 +200,18 @@ def wait_for_log_end(
                         f"[dim]{e}[/dim] (further errors suppressed)"
                     )
                     warned = True
+
+        # Stale-log + dead-supervisor detection: bail out of the wait if
+        # the task process has clearly terminated without cleanup.
+        if supervisor_pid is not None:
+            idle = time.time() - last_size_change
+            if idle > stale_threshold_sec and not _pid_alive(supervisor_pid):
+                console.print(
+                    f"[yellow]task supervisor pid={supervisor_pid} is gone and "
+                    f"log hasn't grown for {int(idle)}s — assuming task died "
+                    f"without cleanup (likely OOM / SIGKILL / closed terminal)[/yellow]"
+                )
+                return False, None
+
         time.sleep(3)
     return False, None
