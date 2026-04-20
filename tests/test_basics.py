@@ -669,6 +669,39 @@ tasks:
     assert "└── tests/" in result["project_summary"]
 
 
+def test_decomposer_bare_fences_sanitized(tmp_path: Path):
+    """Regression: bare triple-backtick lines inside content: | blocks
+    cause yaml.safe_load to fail with "found character '`' that cannot
+    start any token". _sanitize_fences must convert them to YAML
+    comments so parsing succeeds."""
+    from unittest.mock import patch, MagicMock
+    from rufler.decomposer import decompose
+
+    stdout = '''\
+tasks:
+  - name: task_1
+    title: "Write code"
+    content: |
+      ## Scope
+      Add a function.
+      ```rust
+      fn main() {
+          println!("hello");
+      }
+      ```
+      See above.
+'''
+    mock_res = MagicMock(returncode=0, stdout=stdout, stderr="")
+    with patch("rufler.decomposer._claude_bin", return_value="/usr/bin/claude"), \
+         patch("rufler.stream_log.stream_claude", return_value=mock_res):
+        result = decompose("x", 1, tmp_path / "t", tmp_path / "d.yml")
+
+    assert len(result["tasks"]) == 1
+    content = (tmp_path / "t" / "task_1.md").read_text()
+    assert "fn main()" in content
+    assert "println!" in content
+
+
 def test_decomposer_missing_project_summary_tolerated(tmp_path: Path):
     """If the model omits project_summary, decompose() still returns the
     tasks and sets project_summary to empty string — the caller warns
