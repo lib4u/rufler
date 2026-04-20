@@ -444,6 +444,19 @@ def register(app: typer.Typer, console: Console) -> None:
 
         try:
             if cfg.task.run_mode == "parallel" or not cfg.task.multi:
+                pre_spawn_sizes: dict[int, int] = {}
+                if eff.background:
+                    for i, (tname, _tbody) in enumerate(tasks, 1):
+                        if i in skip_slots:
+                            continue
+                        lp = _log_path_for(tname)
+                        if lp.exists():
+                            try:
+                                pre_spawn_sizes[i] = lp.stat().st_size
+                            except OSError:
+                                pre_spawn_sizes[i] = 0
+                        else:
+                            pre_spawn_sizes[i] = 0
                 for i, (tname, tbody) in enumerate(tasks, 1):
                     if i in skip_slots:
                         con.print(
@@ -451,6 +464,39 @@ def register(app: typer.Typer, console: Console) -> None:
                         )
                         continue
                     _spawn_one(i, tname, tbody)
+                if eff.background:
+                    # Background parallel: _spawn_one detaches and returns
+                    # without waiting. Without this pass, te.rc stays None so
+                    # on_task_complete.report never fires and the final-report
+                    # any_succeeded check sees rc=None → skips too.
+                    for i, (tname, tbody) in enumerate(tasks, 1):
+                        if i in skip_slots:
+                            continue
+                        te = reg_entry.tasks[i - 1]
+                        con.print(f"[dim]waiting for {tname} to finish...[/dim]")
+                        found, log_rc = wait_for_log_end(
+                            Path(te.log_path),
+                            cfg.task.timeout_minutes * 60,
+                            con,
+                            start_offset=pre_spawn_sizes.get(i, 0),
+                            supervisor_pid=te.pid,
+                        )
+                        task_rc = log_rc if log_rc is not None else (
+                            0 if found else 1
+                        )
+                        te.finished_at = time.time()
+                        te.rc = task_rc
+                        emit_task_marker(
+                            Path(te.log_path), "task_end",
+                            task_id=te.id, slot=te.slot, rc=task_rc,
+                        )
+                        registry.update(reg_entry)
+                        if task_rc == 0 and cfg.task.on_task_complete.report:
+                            run_report(
+                                cfg, runner, reg_entry, registry, eff, con,
+                                spec=cfg.task.on_task_complete,
+                                task_name=tname, source="task_report",
+                            )
             else:
                 for i, (tname, tbody) in enumerate(tasks, 1):
                     if i in skip_slots:
