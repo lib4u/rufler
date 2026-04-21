@@ -115,15 +115,43 @@ def _claude_bin() -> Optional[str]:
     return shutil.which("claude")
 
 
+def _sanitize_fences(text: str) -> str:
+    """Replace markdown fenced code blocks with YAML-safe equivalents.
+
+    Models frequently wrap code examples inside ``content: |`` blocks
+    with triple-backtick fences.  YAML's parser rejects bare `` ``` ``
+    as an invalid token.  We convert opening fences (```lang) to a
+    visible ``### code-block: lang`` marker and closing fences (```)
+    to ``### end-code-block``, which are valid lines inside a literal
+    block scalar.
+    """
+    out = []
+    for ln in text.splitlines():
+        stripped = ln.strip()
+        if re.match(r"^```+\s*$", stripped):
+            out.append(ln.replace(stripped, "# end-code-block"))
+        elif re.match(r"^```+\w*", stripped):
+            lang = stripped.lstrip("`").strip()
+            marker = f"# code-block: {lang}" if lang else "# code-block"
+            out.append(ln.replace(stripped, marker))
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
 def _extract_yaml(text: str) -> str:
     """Pull a YAML document out of the model's reply.
 
     Anchors beat fences. When the YAML itself contains fenced code
     inside a ``content: |`` block (e.g. a directory tree, a code
     sample), a naive ``re.search(r"```...```")`` grabs the INNER fence
-    and returns a non-YAML payload. So we look for the top-level keys
+    and returns a non-YAML payload.  So we look for the top-level keys
     first, and only fall back to a yaml-tagged fence when no anchor is
     present.
+
+    After extraction, ``_sanitize_fences`` converts any remaining
+    triple-backtick lines into YAML comments so ``safe_load`` never
+    chokes on them.
 
     Order:
     1. First top-level ``project_summary:`` or ``tasks:`` line — take
@@ -137,11 +165,11 @@ def _extract_yaml(text: str) -> str:
     for anchor in ("project_summary:", "tasks:"):
         for i, ln in enumerate(lines):
             if ln.lstrip().startswith(anchor):
-                return "\n".join(lines[i:]).strip()
+                return _sanitize_fences("\n".join(lines[i:]).strip())
     m = re.search(r"```(?:yaml|yml)\s*\n(.*?)```", text, re.DOTALL)
     if m:
-        return m.group(1).strip()
-    return text
+        return _sanitize_fences(m.group(1).strip())
+    return _sanitize_fences(text)
 
 
 def decompose(
