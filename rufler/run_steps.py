@@ -32,6 +32,188 @@ class ExecOverrides:
     log_file: Path
 
 
+@dataclass
+class IterationPaths:
+    """Per-iteration relative paths into `.rufler/` for a multi-pass run.
+
+    For ``cfg.task.iterations == 1`` (the default) the paths are identical
+    to the original yml-configured ones, preserving bit-for-bit
+    backward compatibility for single-pass runs. For iterations >= 2 the
+    paths are namespaced under ``.rufler/iter-NN/`` so each pass gets a
+    clean workspace and prior iterations' artifacts survive for the
+    judge / final-report phases to consume.
+
+    Paths are relative strings (same shape as yml defaults) — the caller
+    resolves against ``cfg.base_dir``.
+    """
+    deep_think_output: str
+    decompose_dir: str
+    decompose_file: str
+    on_task_complete_report_path: str
+    on_complete_report_path: str
+    judge_output: str  # only used when iteration_judge enabled
+
+
+@dataclass
+class _OriginalTaskPaths:
+    """Snapshot of the yml-configured paths on cfg.task, captured once at
+    the start of the iteration loop so we can restore them after the
+    loop finishes (in case downstream code reads cfg again)."""
+    deep_think_output: str
+    decompose_dir: str
+    decompose_file: str
+    on_task_complete_report_path: str
+    on_complete_report_path: str
+    group_snapshot: list
+    project_summary: str
+
+
+def snapshot_task_paths(cfg: FlowConfig) -> _OriginalTaskPaths:
+    """Capture the yml-configured paths on cfg.task so we can restore
+    them after the iteration loop. Also snapshots the initial
+    task.group / project_summary so per-iter regeneration (force_new
+    per-iter) starts from the same base state each pass."""
+    return _OriginalTaskPaths(
+        deep_think_output=cfg.task.deep_think_output,
+        decompose_dir=cfg.task.decompose_dir,
+        decompose_file=cfg.task.decompose_file,
+        on_task_complete_report_path=cfg.task.on_task_complete.report_path,
+        on_complete_report_path=cfg.task.on_complete.report_path,
+        group_snapshot=list(cfg.task.group),
+        project_summary=cfg.task.project_summary,
+    )
+
+
+def restore_task_paths(cfg: FlowConfig, orig: _OriginalTaskPaths) -> None:
+    cfg.task.deep_think_output = orig.deep_think_output
+    cfg.task.decompose_dir = orig.decompose_dir
+    cfg.task.decompose_file = orig.decompose_file
+    cfg.task.on_task_complete.report_path = orig.on_task_complete_report_path
+    cfg.task.on_complete.report_path = orig.on_complete_report_path
+    cfg.task.group = list(orig.group_snapshot)
+    cfg.task.project_summary = orig.project_summary
+
+
+def iteration_paths(
+    orig: _OriginalTaskPaths,
+    iter_num: int,
+    total_iters: int,
+    scope: str = "full",
+) -> IterationPaths:
+    """Compute the per-iteration paths for iteration *iter_num* (1-based).
+
+    When *total_iters* == 1, returns the original yml paths unchanged —
+    existing single-pass runs see zero behavioural change.
+
+    When *total_iters* > 1, paths are namespaced under ``.rufler/iter-NN/``
+    for the phases that are regenerated each iteration. Phases that are
+    reused across iterations (depending on *scope*) keep the original
+    yml paths so cached artifacts are found on re-entry:
+
+      - ``full``           — analysis, tasks, reports all per-iter
+      - ``decompose_only`` — analysis shared (iter 1 output reused),
+                             tasks + reports per-iter
+      - ``tasks_only``     — analysis + decomposed tasks shared (iter 1),
+                             only reports per-iter
+    """
+    if total_iters <= 1:
+        return IterationPaths(
+            deep_think_output=orig.deep_think_output,
+            decompose_dir=orig.decompose_dir,
+            decompose_file=orig.decompose_file,
+            on_task_complete_report_path=orig.on_task_complete_report_path,
+            on_complete_report_path=orig.on_complete_report_path,
+            judge_output=".rufler/judge.md",
+        )
+    iter_dir = f".rufler/iter-{iter_num:02d}"
+    # Defaults: full scope — everything namespaced.
+    deep_think_output = f"{iter_dir}/analysis.md"
+    decompose_dir = f"{iter_dir}/tasks"
+    decompose_file = f"{iter_dir}/decomposed_tasks.yml"
+    if scope == "decompose_only":
+        deep_think_output = orig.deep_think_output
+    elif scope == "tasks_only":
+        deep_think_output = orig.deep_think_output
+        decompose_dir = orig.decompose_dir
+        decompose_file = orig.decompose_file
+    return IterationPaths(
+        deep_think_output=deep_think_output,
+        decompose_dir=decompose_dir,
+        decompose_file=decompose_file,
+        on_task_complete_report_path=f"{iter_dir}/reports/{{task}}.md",
+        on_complete_report_path=f"{iter_dir}/report.md",
+        judge_output=f"{iter_dir}/judge.md",
+    )
+
+
+def apply_iteration_paths(cfg: FlowConfig, paths: IterationPaths) -> None:
+    """Mutate cfg.task in place so downstream run_deep_think /
+    decompose_task_group / run_report read the iteration-scoped paths."""
+    cfg.task.deep_think_output = paths.deep_think_output
+    cfg.task.decompose_dir = paths.decompose_dir
+    cfg.task.decompose_file = paths.decompose_file
+    cfg.task.on_task_complete.report_path = paths.on_task_complete_report_path
+    cfg.task.on_complete.report_path = paths.on_complete_report_path
+
+
+def collect_prior_reports(
+    base_dir: Path,
+    orig: _OriginalTaskPaths,
+    total_iters: int,
+    up_to_iter: int,
+    scope: str = "full",
+) -> str:
+    """Return a Markdown block containing every report written by prior
+    iterations (both per-task and final), each preceded by a header
+    identifying its iteration and source. Used to seed the next
+    iteration's deep_think and the judge agent.
+
+    *up_to_iter* is inclusive — pass ``current_iter - 1`` before
+    starting iteration N, or ``current_iter`` after iteration N's
+    reports have been written (before judging).
+    """
+    if up_to_iter < 1 or total_iters <= 1:
+        return ""
+    parts: list[str] = []
+    for i in range(1, up_to_iter + 1):
+        iter_paths = iteration_paths(orig, i, total_iters, scope)
+        # Final (per-iter) report
+        final_abs = (base_dir / iter_paths.on_complete_report_path).resolve()
+        if final_abs.exists():
+            try:
+                body = final_abs.read_text(encoding="utf-8").strip()
+            except OSError:
+                body = ""
+            if body:
+                parts.append(
+                    f"### Iteration {i:02d} — final report "
+                    f"({iter_paths.on_complete_report_path})\n\n{body}"
+                )
+        # Per-task reports — substitute a dummy name, take parent to
+        # get the reports directory. rstrip dance doesn't work because
+        # the template ends in `.md`; Path.parent is the reliable way.
+        per_task_tmpl = iter_paths.on_task_complete_report_path
+        if "{task}" in per_task_tmpl:
+            reports_dir = (base_dir / per_task_tmpl.replace("{task}", "_")).parent
+            try:
+                candidates = sorted(reports_dir.glob("*.md")) if reports_dir.exists() else []
+            except OSError:
+                candidates = []
+            for rp in candidates:
+                try:
+                    body = rp.read_text(encoding="utf-8").strip()
+                except OSError:
+                    continue
+                if not body:
+                    continue
+                try:
+                    rel = rp.relative_to(base_dir)
+                except ValueError:
+                    rel = rp
+                parts.append(f"### Iteration {i:02d} — task report ({rel})\n\n{body}")
+    return "\n\n---\n\n".join(parts)
+
+
 def resolve_exec_overrides(
     cfg: FlowConfig,
     background: Optional[bool],
@@ -64,12 +246,20 @@ def run_deep_think(
     *,
     force_new: bool = False,
     log_path: Optional[Path] = None,
+    previous_iterations_summary: Optional[str] = None,
+    iter_num: int = 1,
+    total_iters: int = 1,
 ) -> str | None:
     """Run the Deep Think phase — analyze the project before decompose/execute.
 
     Returns the analysis text, or None if deep_think is disabled.
     Caches the result to ``cfg.task.deep_think_output``; reuses on re-run
     unless *force_new* is True.
+
+    For iterative runs (``cfg.task.iterations > 1``), pass
+    *previous_iterations_summary* (accumulated prior-iter reports) plus
+    *iter_num* / *total_iters* so the deep_think prompt frames the pass
+    as a refinement instead of a fresh analysis.
     """
     if not cfg.task.deep_think:
         return None
@@ -128,6 +318,9 @@ def run_deep_think(
             timeout=cfg.task.deep_think_timeout,
             budget=cfg.task.deep_think_budget,
             log_path=log_path,
+            previous_iterations_summary=previous_iterations_summary,
+            iter_num=iter_num,
+            total_iters=total_iters,
             **extra_kw,
         )
     except Exception as e:

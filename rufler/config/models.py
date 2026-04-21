@@ -15,6 +15,7 @@ from typing import Optional
 VALID_ROLES = {"queen", "specialist", "worker", "scout"}
 VALID_SENIORITY = {"lead", "senior", "junior"}
 VALID_RUN_MODES = {"sequential", "parallel"}
+VALID_ITERATION_SCOPES = {"full", "decompose_only", "tasks_only"}
 
 # Skill pack taxonomy — mirrors SKILLS_MAP in ruflo's
 # v3/@claude-flow/cli/src/init/executor.ts. Split by install mechanism:
@@ -332,6 +333,34 @@ class TaskSpec:
     # writes to a side-file, the fallback in tasks/deep_think.py reads
     # that file rather than treating stdout as empty.
     deep_think_allowed_tools: Optional[str] = None
+
+    # --- Iterative refinement ---
+    # Repeat the whole pipeline (deep_think → decompose → execute → report)
+    # N times, feeding accumulated reports from prior iterations into each
+    # next deep_think so the plan refines instead of restarting blind.
+    # iterations=1 keeps the original one-shot behaviour bit-for-bit.
+    iterations: int = 1
+    # full          — redo deep_think + decompose + execute every iter
+    # decompose_only— deep_think once, re-decompose + re-execute each iter
+    # tasks_only    — deep_think + decompose once, re-execute each iter
+    iteration_scope: str = "full"
+    # When true, every iteration beyond the first gets a "PRIOR ITERATIONS"
+    # block injected into the deep_think prompt (all accumulated reports).
+    iteration_refine: bool = True
+    # Hard-stop if judge verdict is "done" AND score >= threshold. When
+    # iteration_judge=false the loop always runs all `iterations` passes.
+    iteration_judge: bool = False
+    iteration_judge_model: str = "opus"
+    iteration_judge_effort: str = "max"
+    iteration_judge_timeout: int = 600
+    iteration_judge_prompt: Optional[str] = None
+    iteration_judge_prompt_path: Optional[str] = None
+    iteration_judge_threshold: float = 0.9
+    # Cheap fallback when judge is disabled — stop as soon as all tasks
+    # in an iteration returned rc=0. Off by default because a green run
+    # often still has gaps the judge would catch.
+    iteration_stop_on_success: bool = False
+
     group: list[TaskItem] = field(default_factory=list)
 
     chain: bool = False

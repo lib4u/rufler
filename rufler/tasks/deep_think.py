@@ -113,20 +113,65 @@ aspirational.
 """
 
 
+PRIOR_ITERATIONS_HEADER = """\
+# PRIOR ITERATIONS — READ BEFORE ANALYZING
+
+This is iteration **{iter_num} of {total_iters}** of an iterative refinement \
+loop. Earlier iterations already ran the full deep_think → decompose → \
+execute → report cycle. Their accumulated reports are pasted below. Your \
+job this round is NOT to restart from scratch but to:
+
+1. Treat prior reports as ground truth about what has actually been built.
+2. Re-inspect the codebase to verify claims in those reports still match \
+reality (files may have been reverted, tests may have broken).
+3. Identify **what is still missing or broken** relative to the original \
+TASK below.
+4. Produce an analysis that points this iteration at the remaining gaps — \
+not at work that is already done.
+
+A good iteration-N analysis is shorter and more targeted than iteration-1. \
+If you find the project is already effectively complete, say so explicitly \
+in section 4 "Gaps & Missing Pieces" so the judge can stop the loop.
+
+## Accumulated reports from prior iterations
+
+{prior_reports}
+
+---
+
+"""
+
+
 def build_deep_think_prompt(
     main_task: str,
     template: Optional[str] = None,
+    *,
+    previous_iterations_summary: Optional[str] = None,
+    iter_num: int = 1,
+    total_iters: int = 1,
 ) -> str:
-    """Render the deep-think prompt, filling ``{main}``."""
+    """Render the deep-think prompt, filling ``{main}``.
+
+    When *previous_iterations_summary* is provided (iteration >= 2 with
+    accumulated reports from earlier passes), a PRIOR ITERATIONS header
+    is prepended so the analyzer refines instead of restarting blind.
+    """
     tpl = template if template is not None else DEFAULT_DEEP_THINK_PROMPT
     main_stripped = main_task.strip()
     if "{main}" not in tpl:
         body = f"{tpl.rstrip()}\n\n## TASK TO ANALYZE\n\n{main_stripped}"
     else:
         body = tpl.replace("{main}", main_stripped)
+    prefix = ""
+    if previous_iterations_summary and previous_iterations_summary.strip():
+        prefix = PRIOR_ITERATIONS_HEADER.format(
+            iter_num=iter_num,
+            total_iters=total_iters,
+            prior_reports=previous_iterations_summary.strip(),
+        )
     # DENY_RULES_PROMPT is always prepended, even for user-supplied
     # templates, so rufler's infrastructure stays off-limits unconditionally.
-    return DENY_RULES_PROMPT + body
+    return DENY_RULES_PROMPT + prefix + body
 
 
 def deep_think(
@@ -140,19 +185,32 @@ def deep_think(
     allowed_tools: Optional[str] = None,
     budget: Optional[float] = None,
     log_path: Optional[Path] = None,
+    previous_iterations_summary: Optional[str] = None,
+    iter_num: int = 1,
+    total_iters: int = 1,
 ) -> str:
     """Run a read-only claude session to analyze the project.
 
     Returns the analysis text.  Also writes it to *output_path*.
     When *log_path* is given, claude's stream-json output is written to
     the NDJSON log in real time so ``rufler follow`` can show progress.
+    For iteration loops (iterations > 1), pass
+    *previous_iterations_summary* (accumulated reports) + *iter_num* /
+    *total_iters* to frame the analyzer as a refinement pass rather than
+    a fresh restart.
     Raises ``RuntimeError`` on failure.
     """
     claude = shutil.which("claude")
     if not claude:
         raise RuntimeError("`claude` binary not found on PATH — can't run deep think.")
 
-    prompt = build_deep_think_prompt(main_task, prompt_template)
+    prompt = build_deep_think_prompt(
+        main_task,
+        prompt_template,
+        previous_iterations_summary=previous_iterations_summary,
+        iter_num=iter_num,
+        total_iters=total_iters,
+    )
 
     cmd = [
         claude,

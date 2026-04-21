@@ -23,6 +23,7 @@ from .chain import (
     resolve_chain_flag,
 )
 from .deep_think import deep_think, build_deep_think_prompt
+from .judge import JudgeResult, build_judge_prompt, judge_iteration
 
 __all__ = [
     "TASK_STATUS_COLORS",
@@ -43,4 +44,7 @@ __all__ = [
     "resolve_chain_flag",
     "deep_think",
     "build_deep_think_prompt",
+    "JudgeResult",
+    "build_judge_prompt",
+    "judge_iteration",
 ]

@@ -24,6 +24,7 @@ from .models import (
     SwarmSpec,
     TaskItem,
     TaskSpec,
+    VALID_ITERATION_SCOPES,
     VALID_MCP_SERVER_FIELDS,
     VALID_RUN_MODES,
 )
@@ -113,6 +114,25 @@ def _parse_task(raw: dict) -> TaskSpec:
     if spec.run_mode not in VALID_RUN_MODES:
         raise ValueError(
             f"task.run_mode '{spec.run_mode}' invalid — must be one of {sorted(VALID_RUN_MODES)}"
+        )
+    if not isinstance(spec.iterations, int) or spec.iterations < 1:
+        raise ValueError(
+            f"task.iterations must be a positive integer, got {spec.iterations!r}"
+        )
+    if spec.iteration_scope not in VALID_ITERATION_SCOPES:
+        raise ValueError(
+            f"task.iteration_scope '{spec.iteration_scope}' invalid — must be one of "
+            f"{sorted(VALID_ITERATION_SCOPES)}"
+        )
+    if not (0.0 <= spec.iteration_judge_threshold <= 1.0):
+        raise ValueError(
+            f"task.iteration_judge_threshold must be between 0.0 and 1.0, "
+            f"got {spec.iteration_judge_threshold!r}"
+        )
+    if spec.iteration_judge_timeout <= 0:
+        raise ValueError(
+            f"task.iteration_judge_timeout must be positive, "
+            f"got {spec.iteration_judge_timeout!r}"
         )
     return spec
 

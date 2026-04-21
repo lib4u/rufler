@@ -56,6 +56,7 @@ In short: `ruflo` is the engine, `rufler` is the ignition + dashboard + cruise c
 - **Sequential and parallel run modes** for multi-task groups.
 - **Task chaining** (`task.chain: true`) — in sequential multi-task mode, each new `claude -p` session receives a compressed retrospective of all previous tasks (body + report), so it has full context without sharing a session. Per-task override with `chain: false` on individual group items.
 - **Deep Think** (`task.deep_think: true`) — before decomposing or executing, rufler spawns a read-only `claude -p` session (configurable model, default opus) that scans the project structure, reads key files, and writes a structured analysis to `.rufler/analysis.md`. The analysis is injected into the decomposer and/or the agent objective so every downstream step has project-aware context. Cached on re-run; `--new` forces rescan.
+- **Iterative refinement** (`task.iterations: N`) — run the whole deep_think → decompose → execute → report cycle N times. Each iteration's reports are injected into the next iteration's deep_think so the plan refines instead of restarting blind. Optional **judge agent** (`iteration_judge: true`) evaluates the project at every iteration boundary and short-circuits the loop when a score threshold is reached. Per-iteration artifacts are namespaced under `.rufler/iter-NN/`, task logs get iter prefixes, no collisions.
 - **Detached background mode** with a proper supervisor process and NDJSON logs.
 - **Live dashboard** via `rufler follow` — 4-panel TUI with task list, session stats, AI conversation stream (thinking, text, tool calls), and system events. Tails all per-task logs in multi-task mode.
 - **Custom decomposer prompt** — override the task-splitter prompt inline or from an `.md` file.
@@ -271,6 +272,19 @@ task:
   chain: false                        # true → inject compressed retrospective of previous tasks into the next task's prompt
   chain_max_tokens: 2000              # word budget for the compressed retrospective (body + report combined)
   chain_include_report: true          # include the per-task report in the retrospective (requires on_task_complete.report)
+
+  # --- iterative refinement (repeat the whole pipeline N times) ---
+  iterations: 1                       # 1 = one-shot (default, unchanged behaviour); >1 = loop deep_think→decompose→execute×N
+  iteration_scope: full               # full | decompose_only | tasks_only (what regenerates each iter)
+  iteration_refine: true              # inject prior iterations' reports into next deep_think
+  iteration_judge: false              # true → judge agent decides whether to stop early
+  iteration_judge_model: opus         # model for the judge claude -p session
+  iteration_judge_effort: max         # thinking effort for the judge (low/medium/high/max)
+  iteration_judge_timeout: 600        # seconds
+  iteration_judge_threshold: 0.9      # stop when verdict=done AND score >= threshold (0.0-1.0)
+  iteration_judge_prompt: |           # optional custom judge prompt (placeholders: {main_task}, {project}, {iter_num}, {total_iters}, {threshold}, {accumulated_reports})
+  # iteration_judge_prompt_path: ./prompts/judge.md   # OR load from file
+  iteration_stop_on_success: false    # fallback when judge disabled: break when all tasks rc=0
 
   # --- reports (two levels) ---
   on_task_complete:                     # after EACH task completes
@@ -531,6 +545,118 @@ The token budget is split between the task body (~2/3) and the report (~1/3). If
 | Tasks are independent (service_a, service_b) | No — use parallel mode instead |
 | You already rely on shared memory and it works well | Optional — chain adds redundancy |
 | Prompt budget is tight (very long task bodies + many tasks) | Tune `chain_max_tokens` down |
+
+### Iterative refinement
+
+A single `rufler run` normally executes the pipeline once: deep_think → decompose → execute → report. For complex tasks that benefit from a "polish pass" — filling gaps, hardening tests, fixing what broke in review — set `task.iterations: N` and the **entire pipeline repeats N times**. Each iteration's accumulated reports are fed into the next iteration's deep_think so the analyzer sees what's already done and targets the remaining gaps instead of restarting blind.
+
+```yaml
+task:
+  main: "Build a production-ready X with tests and graceful shutdown"
+  deep_think: true
+  multi: true
+  decompose: true
+  decompose_count: 4
+
+  iterations: 5                   # run the full cycle up to 5 times
+  iteration_scope: full           # full | decompose_only | tasks_only
+  iteration_refine: true          # prior reports → next deep_think
+  iteration_judge: true           # let a judge agent decide when to stop
+  iteration_judge_threshold: 0.9
+```
+
+**What each iteration actually does:**
+
+```
+iter 1:  deep_think → decompose (4 subtasks) → execute → per-iter report → judge
+iter 2:  deep_think (sees iter 1 report) → decompose (4 fresh gap-focused subtasks) → execute → report → judge
+iter 3:  ...
+```
+
+From iteration 2 onwards, the deep_think prompt is prepended with a `PRIOR ITERATIONS` block containing every per-iteration final report and every per-task report written so far. The framing tells the analyzer: *this is iteration N of M, prior iterations already built X, verify what's actually on disk, and produce a refinement plan — not a fresh analysis.*
+
+#### `iteration_scope` — what regenerates
+
+| Scope | deep_think | decompose | execute |
+|---|---|---|---|
+| `full` (default) | every iter | every iter | every iter |
+| `decompose_only` | iter 1 only | every iter | every iter |
+| `tasks_only` | iter 1 only | iter 1 only | every iter |
+
+`full` is the usual choice when you want the analyzer to re-scan the repo each pass. Use `decompose_only` when the project analysis is stable (short run, no architectural drift between iterations) but you want Claude to re-propose subtasks after seeing what was built. Use `tasks_only` when you've hand-written the `group` and just want repeated execution passes over the same subtasks (useful for flaky / long-running tasks that sometimes finish incomplete).
+
+#### Judge agent — automatic early stopping
+
+With `iteration_judge: true`, rufler spawns a short **read-only** `claude -p` session at every iteration boundary. The judge reads the original TASK, the current state of the repo (Read/Glob/Grep/Bash), and every accumulated report, then emits a strict JSON verdict:
+
+```json
+{
+  "verdict": "done",
+  "score": 0.92,
+  "reasoning": "All acceptance criteria met; tests pass at src/api/users_test.go:48",
+  "remaining_work": ""
+}
+```
+
+The loop breaks when `verdict == "done"` AND `score >= iteration_judge_threshold`. Otherwise it continues to the next iteration.
+
+Failure modes are handled conservatively:
+
+- Judge claude missing, timeout, subprocess error, non-zero rc → **loop continues** (fail open, don't stop thinking you're done when you aren't)
+- JSON parse failure → verdict derived from score if present, else "continue"
+- Score clamped to `[0.0, 1.0]`
+- Every verdict is saved to `.rufler/iter-NN/judge.md` with full reasoning, raw output, and parse diagnostics
+
+Custom judge prompt via `iteration_judge_prompt` (inline) or `iteration_judge_prompt_path` (file). Placeholders: `{main_task}`, `{project}`, `{iter_num}`, `{total_iters}`, `{threshold}`, `{accumulated_reports}`.
+
+Fallback for runs without a judge: `iteration_stop_on_success: true` breaks the loop as soon as every real task in an iteration returned `rc=0`. Cheaper than a judge but will stop early even when the code technically runs but doesn't actually satisfy the task.
+
+#### On-disk layout for `iterations > 1`
+
+Per-iteration artifacts are namespaced under `.rufler/iter-NN/` so no file is ever overwritten between passes:
+
+```
+.rufler/
+├── iter-01/
+│   ├── analysis.md              # deep_think output for this iteration
+│   ├── decomposed_tasks.yml     # companion yml for iter 1's subtasks
+│   ├── tasks/task_1.md          # decomposer-written subtask bodies
+│   ├── tasks/task_2.md
+│   ├── reports/task_1.md        # per-task completion reports
+│   ├── reports/task_2.md
+│   ├── report.md                # per-iter final report
+│   └── judge.md                 # judge verdict + reasoning + raw output
+├── iter-02/
+│   └── …same shape…
+├── iter-03/
+│   └── …
+├── run.i01-task_1.log           # claude stdout per task (iter-prefixed)
+├── run.i02-task_1.log           # iter 2's task_1 → separate log, no overwrite
+├── run.judge.i01.log            # judge-agent claude stdout
+└── run.judge.i02.log
+```
+
+Task names in the registry are iter-prefixed (`i01-task_1`, `i02-task_1`, …) so `rufler tasks` and `rufler follow` show every iteration's work distinctly. Slots are global across iterations.
+
+When `iterations: 1` (the default), none of this namespacing kicks in — paths, log names, and registry entries are identical to pre-iteration behaviour. Single-pass runs see zero change.
+
+#### Caveats and cost control
+
+- **Cost scales linearly.** Five iterations = 5× deep_think + 5× decompose + 5× full swarm spawn + 5× report + 5× judge. On Opus this can easily be hours and tens of dollars — run `rufler run --dry-run` first, and keep the judge enabled for early exit.
+- **Foreground parallel is still foreground.** `run_mode: parallel` with `iterations > 1` runs each iteration's parallel batch (which in foreground blocks sequentially anyway) and waits for the batch to finish before moving on. For true parallelism across tasks within an iteration, use `rufler run -d`.
+- **Resume is iter-1 only.** The resume logic (`find_resumable_run`, `completed_task_names`) applies on iteration 1. From iteration 2 onwards, every task in the new iteration runs unconditionally — that's the point of refinement. Use `--new` to also force iter 1 to start clean.
+- **No per-iter `Ctrl+C` semantics yet.** Ctrl+C / `rufler stop` kill everything, including a potentially healthy iteration that was about to finish. A graceful "stop after this iteration" mechanism isn't implemented — tell the judge to set a tight threshold, or edit `iterations` before the next run.
+
+#### When to use iterations
+
+| Situation | Use iterations? |
+|---|---|
+| One focused task, you trust a single pass | No — `iterations: 1` |
+| "Build X and polish it to prod quality" | Yes — 3-5 iterations with judge |
+| Fixing flaky output by retrying the same group | Yes — `iteration_scope: tasks_only`, no judge needed |
+| Analysis is expensive and the repo is stable | `iteration_scope: decompose_only` + judge |
+| Budget-sensitive | Either skip iterations or rely heavily on `iteration_judge_threshold: 0.85` to exit early |
+| CI / reproducibility-critical | No — iterations introduce judge / LLM variance between runs |
 
 ---
 
@@ -1112,13 +1238,15 @@ rufler run ./examples/rust-cli/rufler_flow.yml
 1. **`rufler check`** — resolves `node`, `claude`, `ruflo` (local → PATH → npm global → `npx`) and reports what it found.
 2. **`rufler run`** —
    1. Loads and validates `rufler_flow.yml` into typed dataclasses.
-   2. If `task.decompose`, calls `claude -p` to decompose `main` into N subtasks and writes `.tasks/*.md` + companion yml.
-   3. Writes `.claude/settings.local.json` with `permissions.defaultMode=bypassPermissions` as a safety net.
-   4. Runs `ruflo init --force` (unless `--skip-init`), `daemon start`, `memory init`, `swarm init`, `hive-mind init`.
-   5. For each task in the group (or the single mono task), composes an objective prompt — project header, task body, all agents sorted lead→senior→junior, autonomy footer.
-   6. Spawns `ruflo hive-mind spawn --count=N --role=... --claude --dangerously-skip-permissions=true --objective=<composed>`.
-   7. In foreground: streams to terminal via `python -m rufler.logwriter --tee`. In `-d`: detaches via `Popen(start_new_session=True)` with stdio → `/dev/null` and stdout/stderr piped into the supervisor.
-   8. Sequential multi-task mode polls the log tail for the `log ended` marker (scanning only bytes added after spawn, to avoid stale markers).
+   2. If `task.deep_think`, spawns a read-only `claude -p` session that writes project analysis to `.rufler/analysis.md` (or `.rufler/iter-NN/analysis.md` in iteration mode).
+   3. If `task.decompose`, calls `claude -p` to decompose `main` into N subtasks and writes `.tasks/*.md` + companion yml.
+   4. Writes `.claude/settings.local.json` with `permissions.defaultMode=bypassPermissions` as a safety net.
+   5. Runs `ruflo init --force` (unless `--skip-init`), `daemon start`, `memory init`, `swarm init`, `hive-mind init`.
+   6. For each task in the group (or the single mono task), composes an objective prompt — project header, task body, all agents sorted lead→senior→junior, autonomy footer.
+   7. Spawns `ruflo hive-mind spawn --count=N --role=... --claude --dangerously-skip-permissions=true --objective=<composed>`.
+   8. In foreground: streams to terminal via `python -m rufler.logwriter --tee`. In `-d`: detaches via `Popen(start_new_session=True)` with stdio → `/dev/null` and stdout/stderr piped into the supervisor.
+   9. Sequential multi-task mode polls the log tail for the `log ended` marker (scanning only bytes added after spawn, to avoid stale markers).
+   10. If `task.iterations > 1`, steps 2–9 are wrapped in a loop. Each iteration's reports are collected and injected into the next iteration's deep_think. After every iteration an optional judge agent evaluates stop conditions; the loop breaks early on `verdict=done AND score >= threshold`.
 3. **`rufler stop`** — post-task hook + autopilot disable + hive-mind shutdown + daemon stop + session-end.
 
 ---
@@ -1154,11 +1282,17 @@ rufler/
 │   ├── templates.py     # `rufler init` sample
 │   ├── tasks/           # task tracking subpackage
 │   │   ├── resolve.py   # status derivation, resume logic, per-task tokens
-│   │   └── display.py   # Rich tables, detail cards, log tail rendering
+│   │   ├── display.py   # Rich tables, detail cards, log tail rendering
+│   │   ├── deep_think.py # project analysis phase (iter-aware prompt)
+│   │   ├── judge.py     # iteration judge — read-only verdict on stop/continue
+│   │   └── report.py    # per-task + final report agents
 │   ├── skills/          # skill install/display subpackage
 │   └── process/         # daemonization, pid management, log paths
 ├── tests/
-│   └── test_basics.py   # 71 tests (registry, tokens, tasks, resume, CLI)
+│   ├── test_basics.py      # registry, tokens, tasks, resume, CLI
+│   ├── test_chain.py       # task chain retrospective compression
+│   ├── test_deep_think.py  # deep_think prompt + subprocess wiring
+│   └── test_iterations.py  # iteration config, per-iter paths, judge JSON parsing
 └── examples/            # ready-to-run rufler_flow.yml files
 ```
 
